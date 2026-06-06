@@ -1,6 +1,7 @@
-logrecovery
-logrecovery.exe
+/logrecovery
+/logrecovery.exe
 *.db
 *.duckdb
-config.yaml
+/config.yaml
 schema.json
+.DS_Store
