@@ -1,0 +1,6 @@
+logrecovery
+logrecovery.exe
+*.db
+*.duckdb
+config.yaml
+schema.json
