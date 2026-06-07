@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" class="dark">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -7,13 +7,12 @@
 <script src="https://cdn.tailwindcss.com"></script>
 <script>
 tailwind.config = {
-  darkMode: 'class',
   theme: {
     extend: {
+      fontFamily: { sans:['Inter','system-ui','sans-serif'], mono:['JetBrains Mono','monospace'] },
       colors: {
-        surface: { 800:'#18181b', 900:'#111113', 950:'#09090b' }
-      },
-      fontFamily: { sans:['Inter','system-ui','sans-serif'], mono:['JetBrains Mono','monospace'] }
+        brand: { 50:'#fff1f1', 100:'#ffe4e4', 200:'#fecaca', 500:'#ef4444', 600:'#dc2626', 700:'#b91c1c' }
+      }
     }
   }
 }
@@ -23,321 +22,311 @@ tailwind.config = {
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
 <style>
   [x-cloak]{display:none!important}
-  .mono{font-family:'JetBrains Mono',monospace}
-  .op-INSERT{@apply bg-emerald-500/10 text-emerald-400 border border-emerald-500/20}
-  .op-UPDATE{@apply bg-blue-500/10 text-blue-400 border border-blue-500/20}
-  .op-DELETE{@apply bg-red-500/10 text-red-400 border border-red-500/20}
-  .op-other{@apply bg-zinc-500/10 text-zinc-400 border border-zinc-500/20}
-  .scrollbar-thin::-webkit-scrollbar{width:4px;height:4px}
-  .scrollbar-thin::-webkit-scrollbar-track{background:transparent}
-  .scrollbar-thin::-webkit-scrollbar-thumb{background:#3f3f46;border-radius:2px}
-  th.sortable{cursor:pointer;user-select:none}
-  th.sortable:hover{color:#e4e4e7}
-  tr.sel{background:rgba(220,38,38,.06)!important}
+  body { background: #f8f7f3; }
+  .mono { font-family: 'JetBrains Mono', monospace; }
+
+  @keyframes shimmer {
+    0%   { background-position: -400px 0; }
+    100% { background-position: calc(400px + 100%) 0; }
+  }
+  .skeleton {
+    background: linear-gradient(90deg, #ede9e1 8%, #e4dfd6 18%, #ede9e1 33%);
+    background-size: 800px 100%;
+    animation: shimmer 1.3s linear infinite;
+    border-radius: 3px;
+  }
+
+  ::-webkit-scrollbar { width: 5px; height: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #d6d3cb; border-radius: 3px; }
+
+  .event-row .row-actions { opacity: 0; transition: opacity 0.12s; }
+  .event-row:hover .row-actions,
+  .event-row.ev-selected .row-actions { opacity: 1; }
 </style>
 </head>
-<body class="dark bg-surface-950 text-zinc-200 font-sans antialiased min-h-screen"
+<body class="text-stone-900 font-sans antialiased min-h-screen"
   x-data="dashboard()" x-init="init()">
 
-<!-- ── HEADER ─────────────────────────────────────────────────────────────── -->
-<header class="sticky top-0 z-30 border-b border-white/5 bg-surface-900/80 backdrop-blur">
-  <div class="max-w-screen-2xl mx-auto px-4 h-13 flex items-center gap-3 h-14">
+<!-- ── HEADER ─────────────────────────────────────────────────── -->
+<header class="sticky top-0 z-30 bg-white border-b border-stone-200">
+  <div class="max-w-screen-xl mx-auto px-5 h-14 flex items-center gap-4">
 
-    <a href="./index.html" class="flex items-center gap-2 shrink-0 group">
-      <svg class="w-5 h-5 text-red-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <path stroke-linecap="round" stroke-linejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
-        <path stroke-linecap="round" stroke-linejoin="round" d="M7.5 10.5L5 12l2.5 1.5"/>
-      </svg>
-      <span class="text-sm font-semibold text-white tracking-tight">rollback<span class="text-red-500">4sqlserver</span></span>
+    <a href="./index.html" class="flex items-center gap-1.5 shrink-0">
+      <span class="text-brand-600 font-mono font-bold text-lg leading-none">⟲</span>
+      <span class="text-sm font-semibold tracking-tight text-stone-900">rollback4sqlserver</span>
+      <span class="text-stone-400 text-xs hidden sm:inline">by dbaops</span>
     </a>
 
-    <div class="w-px h-5 bg-white/10 shrink-0"></div>
+    <div class="w-px h-5 bg-stone-200 shrink-0"></div>
 
-    <!-- Agent URL -->
+    <!-- Agent URL + Connect -->
     <div class="flex items-center gap-2 flex-1 max-w-xs">
-      <span class="text-[11px] text-zinc-600 shrink-0 font-medium">Agent</span>
+      <span class="text-[10px] text-stone-400 shrink-0 font-semibold uppercase tracking-widest">Agent</span>
       <input x-model="agentUrl" @keydown.enter="connect()"
-        class="flex-1 min-w-0 bg-white/5 border border-white/10 rounded-md px-2.5 py-1.5 text-[11px] mono text-zinc-300
-               focus:outline-none focus:border-red-500/50 focus:ring-1 focus:ring-red-500/20 transition"
+        class="flex-1 min-w-0 bg-stone-50 border border-stone-200 rounded-md px-2.5 py-1.5 text-[11px] mono text-stone-700
+               focus:outline-none focus:border-brand-500 focus:ring-1 focus:ring-brand-100 transition"
         placeholder="http://localhost:8182">
       <button @click="connect()"
         :class="connected
-          ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500/15'
-          : 'bg-red-600 text-white hover:bg-red-500'"
-        class="shrink-0 px-3 py-1.5 rounded-md text-[11px] font-medium transition">
-        <span x-text="connected ? '● Live' : connecting ? '…' : 'Connect'"></span>
+          ? 'bg-green-50 text-green-700 border border-green-200 hover:bg-green-100'
+          : 'bg-brand-600 text-white hover:bg-brand-500 border border-transparent'"
+        class="shrink-0 px-3 py-1.5 rounded-md text-[10px] font-bold uppercase tracking-widest transition">
+        <span x-text="connected ? '● LIVE' : connecting ? '…' : 'CONNECT'"></span>
       </button>
+    </div>
+
+    <!-- Stats strip -->
+    <div x-show="connected" x-cloak class="hidden md:flex items-center gap-4 text-[11px] mono ml-2">
+      <span><span class="text-stone-700 font-bold" x-text="(stats.total||0).toLocaleString()"></span><span class="text-stone-400"> total</span></span>
+      <span class="text-green-700 font-semibold" x-text="(stats.inserts||0).toLocaleString() + ' ins'"></span>
+      <span class="text-amber-700 font-semibold" x-text="(stats.updates||0).toLocaleString() + ' upd'"></span>
+      <span class="text-red-700 font-semibold" x-text="(stats.deletes||0).toLocaleString() + ' del'"></span>
     </div>
 
     <div class="flex-1"></div>
 
-    <!-- Live + event count -->
-    <div x-show="connected" x-cloak class="flex items-center gap-4 text-[11px] text-zinc-600">
-      <span x-show="polling" class="flex items-center gap-1.5">
-        <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-        polling
-      </span>
-      <span x-text="totalCount.toLocaleString() + ' events'"></span>
+    <!-- Polling indicator -->
+    <div x-show="connected && polling" x-cloak class="flex items-center gap-1.5 text-[10px] text-stone-400 font-semibold uppercase tracking-widest">
+      <span class="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse inline-block"></span>
+      Polling
     </div>
 
-    <!-- Dark mode -->
-    <button @click="$el.closest('html').classList.toggle('dark'); darkMode=!darkMode"
-      class="p-1.5 rounded-md text-zinc-600 hover:text-zinc-300 hover:bg-white/5 transition">
-      <svg x-show="darkMode" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-        <path stroke-linecap="round" stroke-linejoin="round" d="M12 3v1m0 16v1m8.66-9h-1M4.34 12h-1m15.07-6.36-.7.7M6.3 17.66l-.7.7m12.02 0-.7-.7M6.3 6.34l-.7-.7M12 8a4 4 0 100 8 4 4 0 000-8z"/>
-      </svg>
-      <svg x-show="!darkMode" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-        <path stroke-linecap="round" stroke-linejoin="round" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/>
-      </svg>
-    </button>
   </div>
 </header>
 
-<!-- ── MAIN ───────────────────────────────────────────────────────────────── -->
-<main class="max-w-screen-2xl mx-auto px-4 py-5">
+<!-- ── MAIN ───────────────────────────────────────────────────── -->
+<main class="max-w-screen-xl mx-auto px-5 py-6">
 
-  <!-- ── NOT CONNECTED ── -->
-  <div x-show="!connected" x-cloak class="flex flex-col items-center justify-center py-32 gap-5 text-center">
-    <div class="w-14 h-14 rounded-2xl bg-red-500/10 border border-red-500/20 flex items-center justify-center">
-      <svg class="w-7 h-7 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+  <!-- NOT CONNECTED -->
+  <div x-show="!connected" x-cloak class="flex flex-col items-center justify-center py-24 gap-6 text-center">
+    <div class="w-14 h-14 rounded-2xl bg-brand-50 border border-brand-100 flex items-center justify-center">
+      <svg class="w-7 h-7 text-brand-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
         <path stroke-linecap="round" stroke-linejoin="round" d="M5.636 5.636a9 9 0 1012.728 12.728M5.636 5.636A9 9 0 0118.364 18.364M5.636 5.636L3 3m15.364 15.364L21 21"/>
       </svg>
     </div>
     <div>
-      <p class="font-semibold text-white text-lg mb-1">Connect to Local Agent</p>
-      <p class="text-zinc-500 text-sm max-w-sm">Start <span class="mono text-zinc-400">logrecovery.exe serve</span> on your SQL Server host, then enter its URL above and click Connect.</p>
+      <p class="font-bold text-stone-900 text-xl mb-1.5 tracking-tight">Connect to Local Agent</p>
+      <p class="text-stone-500 text-sm max-w-sm leading-relaxed">Start <span class="mono text-stone-700">logrecovery.exe serve</span> on your SQL Server host, enter its URL above and click Connect.</p>
     </div>
-    <div class="bg-surface-900 border border-white/5 rounded-xl p-4 text-left max-w-md w-full">
-      <p class="text-[10px] text-zinc-600 mb-2 font-semibold uppercase tracking-wider">Quick start</p>
-      <pre class="mono text-xs text-zinc-400 leading-relaxed whitespace-pre-wrap">.\logrecovery.exe serve ^
+    <div class="bg-white border border-stone-200 rounded-xl p-4 text-left max-w-md w-full shadow-sm">
+      <p class="text-[10px] text-stone-400 mb-2.5 font-bold uppercase tracking-widest">Quick start</p>
+      <pre class="mono text-xs text-stone-600 leading-relaxed whitespace-pre-wrap">.\logrecovery.exe serve ^
   --host ".\SQLEXPRESS" ^
   --user sa --pass *** ^
   --all-dbs --since 24h</pre>
     </div>
-    <p x-show="connectError" x-text="connectError" class="text-red-400 text-xs max-w-sm"></p>
+    <p x-show="connectError" x-text="connectError" class="text-red-600 text-xs max-w-sm font-medium"></p>
   </div>
 
-  <!-- ── CONNECTED ── -->
+  <!-- CONNECTED -->
   <div x-show="connected" x-cloak>
 
-    <!-- STATS ROW -->
-    <div class="grid grid-cols-3 sm:grid-cols-6 gap-2.5 mb-4">
-      <template x-for="s in statCards" :key="s.label">
-        <div class="bg-surface-900 border border-white/5 rounded-xl px-4 py-3 hover:border-white/10 transition">
-          <p class="text-[10px] text-zinc-600 font-medium uppercase tracking-wider mb-1" x-text="s.label"></p>
-          <p class="text-xl font-bold" :class="s.color" x-text="s.value.toLocaleString()"></p>
-        </div>
-      </template>
-    </div>
-
     <!-- FILTERS -->
-    <div class="bg-surface-900 border border-white/5 rounded-xl p-3 mb-3 flex flex-wrap gap-2 items-center">
+    <div class="bg-white border border-stone-200 rounded-xl px-4 py-3 mb-3 flex flex-wrap gap-2 items-center shadow-sm">
 
-      <!-- Operation toggles -->
+      <!-- Op toggles -->
       <div class="flex items-center gap-1">
         <template x-for="op in ['INSERT','UPDATE','DELETE']" :key="op">
           <button @click="toggleOp(op)"
             :class="filters.op === op
-              ? (op==='INSERT' ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
-                : op==='UPDATE' ? 'bg-blue-500/15 text-blue-400 border-blue-500/30'
-                : 'bg-red-500/15 text-red-400 border-red-500/30')
-              : 'bg-surface-950 text-zinc-500 border-white/8 hover:text-zinc-300 hover:border-white/15'"
-            class="px-2.5 py-1.5 rounded-lg text-xs font-medium border transition"
+              ? (op==='INSERT' ? 'bg-green-50 text-green-700 border-green-300'
+                : op==='UPDATE' ? 'bg-amber-50 text-amber-700 border-amber-300'
+                : 'bg-red-50 text-red-700 border-red-300')
+              : 'bg-stone-50 text-stone-500 border-stone-200 hover:text-stone-700 hover:border-stone-300'"
+            class="px-2.5 py-1 rounded-lg text-[10px] font-bold uppercase tracking-widest border transition"
             x-text="op">
           </button>
         </template>
       </div>
 
-      <div class="w-px h-5 bg-white/8 shrink-0"></div>
+      <div class="w-px h-5 bg-stone-200 shrink-0"></div>
 
-      <!-- Database -->
       <select x-model="filters.db" @change="resetAndLoad()"
-        class="bg-surface-950 border border-white/8 rounded-lg px-2.5 py-1.5 text-xs text-zinc-300 focus:outline-none focus:border-red-500/40 min-w-[120px]">
+        class="bg-stone-50 border border-stone-200 rounded-lg px-2.5 py-1.5 text-xs text-stone-700 focus:outline-none focus:border-brand-500 min-w-[120px]">
         <option value="">All databases</option>
-        <template x-for="d in stats.databases" :key="d">
+        <template x-for="d in (stats.databases||[])" :key="d">
           <option :value="d" x-text="d"></option>
         </template>
       </select>
 
-      <!-- Table -->
       <select x-model="filters.table" @change="resetAndLoad()"
-        class="bg-surface-950 border border-white/8 rounded-lg px-2.5 py-1.5 text-xs text-zinc-300 focus:outline-none focus:border-red-500/40 min-w-[140px]">
+        class="bg-stone-50 border border-stone-200 rounded-lg px-2.5 py-1.5 text-xs text-stone-700 focus:outline-none focus:border-brand-500 min-w-[140px]">
         <option value="">All tables</option>
-        <template x-for="t in filteredTables" :key="t">
+        <template x-for="t in (stats.tables||[])" :key="t">
           <option :value="t" x-text="t"></option>
         </template>
       </select>
 
-      <div class="w-px h-5 bg-white/8 shrink-0"></div>
+      <div class="w-px h-5 bg-stone-200 shrink-0"></div>
 
-      <!-- Time range -->
       <div class="flex items-center gap-1.5">
         <input x-model="filters.from" @change="resetAndLoad()" type="datetime-local"
-          class="bg-surface-950 border border-white/8 rounded-lg px-2.5 py-1.5 text-xs text-zinc-300 focus:outline-none focus:border-red-500/40"
-          title="From date/time">
-        <span class="text-zinc-700 text-xs">–</span>
+          class="bg-stone-50 border border-stone-200 rounded-lg px-2 py-1.5 text-xs text-stone-700 focus:outline-none focus:border-brand-500"
+          title="From">
+        <span class="text-stone-300 text-xs">–</span>
         <input x-model="filters.to" @change="resetAndLoad()" type="datetime-local"
-          class="bg-surface-950 border border-white/8 rounded-lg px-2.5 py-1.5 text-xs text-zinc-300 focus:outline-none focus:border-red-500/40"
-          title="To date/time">
+          class="bg-stone-50 border border-stone-200 rounded-lg px-2 py-1.5 text-xs text-stone-700 focus:outline-none focus:border-brand-500"
+          title="To">
       </div>
 
-      <div class="w-px h-5 bg-white/8 shrink-0"></div>
+      <div class="w-px h-5 bg-stone-200 shrink-0"></div>
 
-      <!-- Search -->
       <div class="relative flex-1 min-w-[160px]">
-        <svg class="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-600 pointer-events-none" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+        <svg class="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-stone-400 pointer-events-none" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
           <path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
         </svg>
         <input x-model="filters.search" @input.debounce.400ms="resetAndLoad()" type="text" placeholder="Search SQL…"
-          class="w-full bg-surface-950 border border-white/8 rounded-lg pl-8 pr-3 py-1.5 text-xs text-zinc-300 focus:outline-none focus:border-red-500/40 placeholder-zinc-700">
+          class="w-full bg-stone-50 border border-stone-200 rounded-lg pl-8 pr-3 py-1.5 text-xs text-stone-700 focus:outline-none focus:border-brand-500 placeholder-stone-400">
       </div>
 
-      <!-- Clear filters -->
+      <div class="flex items-center gap-1">
+        <select x-model="sortCol" @change="page=1; loadEvents()"
+          class="bg-stone-50 border border-stone-200 rounded-lg px-2 py-1.5 text-xs text-stone-600 focus:outline-none focus:border-brand-500">
+          <option value="event_time">Time</option>
+          <option value="lsn">LSN</option>
+          <option value="operation">Op</option>
+          <option value="db_name">DB</option>
+          <option value="table_name">Table</option>
+        </select>
+        <button @click="sortDir = sortDir==='desc'?'asc':'desc'; page=1; loadEvents()"
+          class="bg-stone-50 border border-stone-200 rounded-lg px-2 py-1.5 text-xs text-stone-500 hover:text-stone-800 hover:border-stone-300 transition mono"
+          x-text="sortDir === 'desc' ? '↓' : '↑'">
+        </button>
+      </div>
+
       <button x-show="hasActiveFilters" @click="clearFilters()"
-        class="text-xs text-zinc-500 hover:text-zinc-300 px-2 py-1.5 rounded-lg hover:bg-white/5 transition">
-        Clear
+        class="text-[10px] font-bold uppercase tracking-widest text-stone-400 hover:text-stone-700 px-2 py-1.5 rounded-lg hover:bg-stone-100 transition">
+        Clear ×
       </button>
     </div>
 
-    <!-- BULK ACTION BAR -->
+    <!-- BULK BAR -->
     <div x-show="selectedIds.length > 0" x-cloak
-      class="bg-red-950/40 border border-red-500/20 rounded-xl px-4 py-2.5 mb-3 flex items-center gap-3">
-      <span class="text-red-400 text-xs font-medium" x-text="selectedIds.length + ' event(s) selected'"></span>
+      class="bg-brand-50 border border-brand-200 rounded-xl px-4 py-2.5 mb-3 flex items-center gap-3">
+      <span class="text-brand-700 text-[10px] font-bold uppercase tracking-widest" x-text="selectedIds.length + ' selected'"></span>
       <button @click="generateBulkRollback()"
-        class="px-3 py-1.5 bg-red-600 hover:bg-red-500 text-white text-xs font-medium rounded-lg transition flex items-center gap-1.5">
-        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
-        </svg>
-        Generate Rollback Script
+        class="px-3 py-1.5 bg-brand-600 hover:bg-brand-500 text-white text-[10px] font-bold uppercase tracking-widest rounded-lg transition">
+        ⟲ Generate Rollback Script
       </button>
-      <button @click="selectedIds = []" class="ml-auto text-zinc-600 hover:text-zinc-400 text-xs transition">Deselect all</button>
+      <button @click="selectedIds = []; selectedEvs = {}" class="ml-auto text-stone-400 hover:text-stone-600 text-xs transition">
+        Deselect all
+      </button>
     </div>
 
-    <!-- TABLE -->
-    <div class="bg-surface-900 border border-white/5 rounded-xl overflow-hidden mb-3">
-      <div class="overflow-x-auto scrollbar-thin">
-        <table class="w-full text-xs">
-          <thead>
-            <tr class="border-b border-white/5">
-              <th class="w-8 px-3 py-2.5 text-left">
-                <input type="checkbox" class="rounded border-white/20 bg-transparent accent-red-500"
-                  :checked="allSelected" @change="toggleSelectAll()" :indeterminate.prop="selectedIds.length > 0 && !allSelected">
-              </th>
-              <th class="sortable px-3 py-2.5 text-left text-[10px] font-semibold uppercase tracking-wider text-zinc-600" @click="sortBy('event_time')">
-                <span class="flex items-center gap-1">Time <span x-text="sortIcon('event_time')"></span></span>
-              </th>
-              <th class="sortable px-3 py-2.5 text-left text-[10px] font-semibold uppercase tracking-wider text-zinc-600" @click="sortBy('operation')">
-                <span class="flex items-center gap-1">Op <span x-text="sortIcon('operation')"></span></span>
-              </th>
-              <th class="sortable px-3 py-2.5 text-left text-[10px] font-semibold uppercase tracking-wider text-zinc-600" @click="sortBy('db_name')">
-                <span class="flex items-center gap-1">Database <span x-text="sortIcon('db_name')"></span></span>
-              </th>
-              <th class="sortable px-3 py-2.5 text-left text-[10px] font-semibold uppercase tracking-wider text-zinc-600" @click="sortBy('table_name')">
-                <span class="flex items-center gap-1">Table <span x-text="sortIcon('table_name')"></span></span>
-              </th>
-              <th class="px-3 py-2.5 text-left text-[10px] font-semibold uppercase tracking-wider text-zinc-600">SQL Preview</th>
-              <th class="sortable px-3 py-2.5 text-left text-[10px] font-semibold uppercase tracking-wider text-zinc-600" @click="sortBy('lsn')">
-                <span class="flex items-center gap-1">LSN <span x-text="sortIcon('lsn')"></span></span>
-              </th>
-              <th class="w-20 px-3 py-2.5 text-right text-[10px] font-semibold uppercase tracking-wider text-zinc-600">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            <!-- Loading skeleton -->
-            <template x-if="loading">
-              <template x-for="i in 8" :key="i">
-                <tr class="border-b border-white/3">
-                  <td class="px-3 py-2.5"><div class="w-4 h-4 bg-white/5 rounded"></div></td>
-                  <td class="px-3 py-2.5"><div class="w-24 h-3 bg-white/5 rounded animate-pulse"></div></td>
-                  <td class="px-3 py-2.5"><div class="w-14 h-5 bg-white/5 rounded animate-pulse"></div></td>
-                  <td class="px-3 py-2.5"><div class="w-20 h-3 bg-white/5 rounded animate-pulse"></div></td>
-                  <td class="px-3 py-2.5"><div class="w-24 h-3 bg-white/5 rounded animate-pulse"></div></td>
-                  <td class="px-3 py-2.5"><div class="w-48 h-3 bg-white/5 rounded animate-pulse"></div></td>
-                  <td class="px-3 py-2.5"><div class="w-32 h-3 bg-white/5 rounded animate-pulse"></div></td>
-                  <td class="px-3 py-2.5"></td>
-                </tr>
-              </template>
-            </template>
+    <!-- EVENT FEED -->
+    <div class="bg-white border border-stone-200 rounded-xl overflow-hidden mb-3 shadow-sm">
 
-            <!-- Empty state -->
-            <template x-if="!loading && events.length === 0">
-              <tr>
-                <td colspan="8" class="px-3 py-14 text-center text-zinc-600 text-xs">No events found.</td>
-              </tr>
-            </template>
+      <!-- Feed header -->
+      <div class="px-5 py-2.5 border-b border-stone-100 flex items-center gap-3 bg-stone-50/60">
+        <input type="checkbox" class="rounded border-stone-300 accent-brand-600"
+          :checked="allSelected" @change="toggleSelectAll()" :indeterminate.prop="selectedIds.length > 0 && !allSelected">
+        <span class="text-[10px] font-bold uppercase tracking-widest text-stone-400">Event Log</span>
+        <span class="text-[10px] text-stone-300 mono ml-auto" x-text="pageInfo"></span>
+      </div>
 
-            <!-- Data rows -->
-            <template x-if="!loading">
-              <template x-for="ev in events" :key="ev.lsn + ev.txn_id">
-                <tr class="border-b border-white/3 hover:bg-white/2 transition-colors"
-                  :class="selectedIds.includes(ev.lsn) ? 'sel' : ''">
-                  <td class="px-3 py-2">
-                    <input type="checkbox" class="rounded border-white/20 bg-transparent accent-red-500"
-                      :checked="selectedIds.includes(ev.lsn)"
-                      @change="toggleSelect(ev)">
-                  </td>
-                  <td class="px-3 py-2 text-zinc-500 mono whitespace-nowrap" x-text="formatTime(ev.event_time)"></td>
-                  <td class="px-3 py-2">
-                    <span class="px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wide"
-                      :class="'op-' + ev.operation" x-text="ev.operation"></span>
-                  </td>
-                  <td class="px-3 py-2 text-zinc-400 truncate max-w-[100px]" x-text="ev.db_name || '—'"></td>
-                  <td class="px-3 py-2 text-zinc-300 truncate max-w-[130px] font-medium"
-                    x-text="ev.schema_name && ev.table_name ? ev.schema_name+'.'+ev.table_name : ev.table_name || '—'"></td>
-                  <td class="px-3 py-2 max-w-xs">
-                    <span class="mono text-zinc-500 truncate block max-w-xs" x-text="truncSQL(ev.sql_stmt)"></span>
-                  </td>
-                  <td class="px-3 py-2 mono text-zinc-700 text-[10px] whitespace-nowrap" x-text="ev.lsn"></td>
-                  <td class="px-3 py-2 text-right">
-                    <div class="flex items-center justify-end gap-1">
-                      <button @click="showSQL(ev)" title="View SQL"
-                        class="p-1.5 rounded-md text-zinc-600 hover:text-zinc-300 hover:bg-white/5 transition">
-                        <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-                          <path stroke-linecap="round" stroke-linejoin="round" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"/>
-                        </svg>
-                      </button>
-                      <button x-show="ev.rollback_sql" @click="showRollback(ev)" title="Rollback SQL"
-                        class="p-1.5 rounded-md text-zinc-600 hover:text-red-400 hover:bg-red-500/10 transition">
-                        <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-                          <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
-                        </svg>
-                      </button>
-                    </div>
-                  </td>
-                </tr>
-              </template>
-            </template>
-          </tbody>
-        </table>
+      <!-- Loading skeleton -->
+      <div x-show="loading">
+        <template x-for="i in 6" :key="i">
+          <div class="flex items-start gap-4 px-5 py-3.5 border-b border-stone-100">
+            <div class="skeleton w-4 h-4 mt-0.5 rounded"></div>
+            <div class="skeleton w-2.5 h-2.5 rounded-full mt-2 shrink-0"></div>
+            <div class="flex-1 space-y-2">
+              <div class="flex gap-3 items-center">
+                <div class="skeleton h-3 w-16 rounded"></div>
+                <div class="skeleton h-3 w-12 rounded"></div>
+                <div class="skeleton h-3 w-32 rounded"></div>
+              </div>
+              <div class="skeleton h-3 w-2/3 rounded"></div>
+            </div>
+          </div>
+        </template>
+      </div>
+
+      <!-- Feed rows (slides in when loading → done) -->
+      <div x-show="!loading" x-cloak
+           x-transition:enter="transition ease-out duration-200"
+           x-transition:enter-start="opacity-0 translate-y-2"
+           x-transition:enter-end="opacity-100 translate-y-0">
+
+        <!-- Empty -->
+        <div x-show="events.length === 0" class="px-5 py-14 text-center">
+          <p class="text-stone-400 text-sm">No events found.</p>
+        </div>
+
+        <!-- Rows -->
+        <template x-for="ev in events" :key="ev.lsn + ev.txn_id">
+          <div class="event-row flex items-start gap-4 px-5 py-3.5 border-b border-stone-100 transition-colors"
+               :class="selectedIds.includes(ev.lsn) ? 'bg-brand-50/50 ev-selected' : 'hover:bg-stone-50/70'">
+
+            <!-- Checkbox -->
+            <input type="checkbox" class="rounded border-stone-300 accent-brand-600 mt-0.5 shrink-0"
+              :checked="selectedIds.includes(ev.lsn)" @change="toggleSelect(ev)">
+
+            <!-- Op dot -->
+            <div class="w-2.5 h-2.5 rounded-full mt-2 shrink-0"
+              :class="{
+                'bg-green-500':  ev.operation === 'INSERT',
+                'bg-red-600':    ev.operation === 'DELETE',
+                'bg-amber-500':  ev.operation === 'UPDATE',
+                'bg-stone-400':  !['INSERT','UPDATE','DELETE'].includes(ev.operation)
+              }"></div>
+
+            <!-- Content -->
+            <div class="flex-1 min-w-0">
+              <div class="flex flex-wrap items-baseline gap-x-2 gap-y-0 mb-0.5">
+                <span class="mono text-[11px] text-stone-400 tabular-nums" x-text="formatTime(ev.event_time)"></span>
+                <span class="text-[11px] font-bold uppercase tracking-widest"
+                  :class="{
+                    'text-green-700':  ev.operation === 'INSERT',
+                    'text-red-700':    ev.operation === 'DELETE',
+                    'text-amber-700':  ev.operation === 'UPDATE',
+                    'text-stone-500':  !['INSERT','UPDATE','DELETE'].includes(ev.operation)
+                  }"
+                  x-text="ev.operation"></span>
+                <span class="text-sm font-semibold text-stone-800"
+                  x-text="(ev.schema_name && ev.table_name) ? ev.schema_name+'.'+ev.table_name : (ev.table_name || '—')"></span>
+                <span x-show="ev.db_name" class="text-xs text-stone-400" x-text="'· ' + ev.db_name"></span>
+                <span class="mono text-[10px] text-stone-300 ml-1" x-text="ev.lsn"></span>
+              </div>
+              <p class="mono text-[11px] text-stone-400 truncate leading-relaxed" x-text="truncSQL(ev.sql_stmt)"></p>
+            </div>
+
+            <!-- Actions (appear on hover/select) -->
+            <div class="row-actions flex items-center gap-2 shrink-0 pt-0.5">
+              <button @click="showSQL(ev)"
+                class="text-[10px] font-bold uppercase tracking-widest text-stone-400 hover:text-stone-800 border border-stone-200 hover:border-stone-400 px-2.5 py-1 rounded transition whitespace-nowrap">
+                SQL →
+              </button>
+              <button x-show="ev.rollback_sql" @click="showRollback(ev)"
+                class="text-[10px] font-bold uppercase tracking-widest text-brand-600 hover:text-brand-700 border border-brand-200 hover:border-brand-400 px-2.5 py-1 rounded transition whitespace-nowrap">
+                Rollback →
+              </button>
+            </div>
+          </div>
+        </template>
       </div>
 
       <!-- PAGINATION FOOTER -->
-      <div class="px-4 py-2.5 border-t border-white/5 flex flex-wrap items-center gap-3 bg-surface-950/40">
-
-        <!-- Page size -->
+      <div class="px-5 py-2.5 border-t border-stone-100 flex flex-wrap items-center gap-3 bg-stone-50/60">
         <div class="flex items-center gap-1.5">
-          <span class="text-[10px] text-zinc-600">Show</span>
+          <span class="text-[10px] text-stone-400 uppercase tracking-widest font-semibold">Rows</span>
           <select x-model.number="pageSize" @change="page=1; loadEvents()"
-            class="bg-surface-900 border border-white/8 rounded-md px-2 py-1 text-[11px] text-zinc-400 focus:outline-none">
-            <option value="25">25</option>
+            class="bg-white border border-stone-200 rounded-md px-2 py-1 text-[11px] text-stone-600 focus:outline-none">
+            <option value="20">20</option>
             <option value="50">50</option>
             <option value="100">100</option>
-            <option value="200">200</option>
           </select>
         </div>
 
-        <!-- Page info -->
-        <span class="text-[11px] text-zinc-500 flex-1 text-center" x-text="pageInfo"></span>
-
-        <!-- Prev / Next -->
-        <div class="flex items-center gap-1">
+        <div class="flex items-center gap-1 ml-auto">
           <button @click="prevPage()" :disabled="page <= 1"
-            class="px-2.5 py-1.5 rounded-md text-xs font-medium border border-white/8 text-zinc-500 hover:text-zinc-300 hover:border-white/15 disabled:opacity-30 disabled:cursor-not-allowed transition">
+            class="px-2.5 py-1.5 rounded-md text-[10px] font-bold uppercase tracking-widest border border-stone-200 text-stone-400 hover:text-stone-700 hover:border-stone-400 disabled:opacity-30 disabled:cursor-not-allowed transition">
             ← Prev
           </button>
-          <span class="px-2 text-[11px] text-zinc-600" x-text="'Page ' + page + ' / ' + totalPages"></span>
+          <span class="px-3 text-[11px] text-stone-400 mono tabular-nums" x-text="page + ' / ' + totalPages"></span>
           <button @click="nextPage()" :disabled="page >= totalPages"
-            class="px-2.5 py-1.5 rounded-md text-xs font-medium border border-white/8 text-zinc-500 hover:text-zinc-300 hover:border-white/15 disabled:opacity-30 disabled:cursor-not-allowed transition">
+            class="px-2.5 py-1.5 rounded-md text-[10px] font-bold uppercase tracking-widest border border-stone-200 text-stone-400 hover:text-stone-700 hover:border-stone-400 disabled:opacity-30 disabled:cursor-not-allowed transition">
             Next →
           </button>
         </div>
@@ -347,113 +336,88 @@ tailwind.config = {
   </div><!-- /connected -->
 </main>
 
-<!-- ── SQL MODAL ──────────────────────────────────────────────────────────── -->
+<!-- ── SQL MODAL ───────────────────────────────────────────────── -->
 <div x-show="modal.show" x-cloak @click.self="modal.show=false"
-  class="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-end sm:items-center justify-center p-4">
-  <div class="w-full max-w-2xl bg-surface-900 border border-white/10 rounded-2xl overflow-hidden shadow-2xl" @click.stop>
-
-    <div class="flex items-center justify-between px-5 py-3.5 border-b border-white/5">
+  class="fixed inset-0 z-50 bg-black/20 backdrop-blur-sm flex items-end sm:items-center justify-center p-4">
+  <div class="w-full max-w-2xl bg-white border border-stone-200 rounded-2xl overflow-hidden shadow-2xl" @click.stop>
+    <div class="flex items-center justify-between px-5 py-3.5 border-b border-stone-100">
       <div class="flex items-center gap-2.5">
-        <span class="w-2 h-2 rounded-full" :class="modal.isRollback ? 'bg-red-500' : 'bg-blue-500'"></span>
-        <h3 class="font-semibold text-sm text-white" x-text="modal.title"></h3>
+        <div class="w-2 h-2 rounded-full" :class="modal.isRollback ? 'bg-brand-500' : 'bg-blue-500'"></div>
+        <h3 class="font-semibold text-sm text-stone-900" x-text="modal.title"></h3>
       </div>
-      <button @click="modal.show=false" class="text-zinc-600 hover:text-zinc-300 transition">
+      <button @click="modal.show=false" class="text-stone-400 hover:text-stone-700 transition p-1">
         <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
           <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/>
         </svg>
       </button>
     </div>
-
-    <div x-show="modal.isRollback" class="px-5 py-2.5 bg-red-950/30 border-b border-red-900/30">
-      <p class="text-[11px] text-red-400 font-medium">⚠ Review this SQL carefully before executing. Test on a non-production environment first.</p>
+    <div x-show="modal.isRollback" class="px-5 py-2 bg-amber-50 border-b border-amber-100">
+      <p class="text-[11px] text-amber-700 font-semibold">⚠ Review this SQL carefully before executing. Test on a non-production environment first.</p>
     </div>
-
-    <div class="p-4 max-h-80 overflow-y-auto scrollbar-thin">
-      <pre class="mono text-xs text-zinc-300 whitespace-pre-wrap leading-relaxed" x-text="modal.sql"></pre>
+    <div class="p-5 max-h-80 overflow-y-auto">
+      <pre class="mono text-xs text-stone-700 whitespace-pre-wrap leading-relaxed" x-text="modal.sql"></pre>
     </div>
-
-    <div class="flex items-center justify-end gap-2 px-5 py-3 border-t border-white/5 bg-surface-950/40">
-      <span x-show="modal.copied" class="text-emerald-400 text-xs mr-auto">Copied!</span>
-      <button @click="copyModal()" class="px-4 py-2 bg-white/8 hover:bg-white/12 text-zinc-300 text-xs font-medium rounded-lg transition">
-        Copy
-      </button>
-      <button @click="modal.show=false" class="px-4 py-2 bg-surface-800 hover:bg-zinc-700 text-zinc-300 text-xs font-medium rounded-lg transition">
-        Close
-      </button>
+    <div class="flex items-center justify-end gap-2 px-5 py-3 border-t border-stone-100 bg-stone-50">
+      <span x-show="modal.copied" class="text-green-600 text-xs font-semibold mr-auto">Copied!</span>
+      <button @click="copyModal()" class="px-4 py-2 bg-stone-100 hover:bg-stone-200 text-stone-700 text-xs font-semibold rounded-lg transition">Copy</button>
+      <button @click="modal.show=false" class="px-4 py-2 bg-stone-800 hover:bg-stone-700 text-white text-xs font-semibold rounded-lg transition">Close</button>
     </div>
   </div>
 </div>
 
-<!-- ── BULK ROLLBACK MODAL ─────────────────────────────────────────────────── -->
+<!-- ── BULK ROLLBACK MODAL ─────────────────────────────────────── -->
 <div x-show="showBulkModal" x-cloak @click.self="showBulkModal=false"
-  class="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-end sm:items-center justify-center p-4">
-  <div class="w-full max-w-2xl bg-surface-900 border border-white/10 rounded-2xl overflow-hidden shadow-2xl" @click.stop>
-
-    <div class="flex items-center justify-between px-5 py-3.5 border-b border-white/5">
+  class="fixed inset-0 z-50 bg-black/20 backdrop-blur-sm flex items-end sm:items-center justify-center p-4">
+  <div class="w-full max-w-2xl bg-white border border-stone-200 rounded-2xl overflow-hidden shadow-2xl" @click.stop>
+    <div class="flex items-center justify-between px-5 py-3.5 border-b border-stone-100">
       <div class="flex items-center gap-2.5">
-        <span class="w-2 h-2 rounded-full bg-red-500"></span>
-        <h3 class="font-semibold text-sm text-white" x-text="'Bulk Rollback Script (' + selectedIds.length + ' events)'"></h3>
+        <div class="w-2 h-2 rounded-full bg-brand-500"></div>
+        <h3 class="font-semibold text-sm text-stone-900" x-text="'Bulk Rollback Script (' + selectedIds.length + ' events)'"></h3>
       </div>
-      <button @click="showBulkModal=false" class="text-zinc-600 hover:text-zinc-300 transition">
+      <button @click="showBulkModal=false" class="text-stone-400 hover:text-stone-700 transition p-1">
         <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
           <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/>
         </svg>
       </button>
     </div>
-
-    <div class="px-5 py-2.5 bg-red-950/30 border-b border-red-900/30">
-      <p class="text-[11px] text-red-400 font-medium">⚠ REVIEW CAREFULLY. Uncomment COMMIT TRANSACTION only after verifying each statement.</p>
+    <div class="px-5 py-2 bg-amber-50 border-b border-amber-100">
+      <p class="text-[11px] text-amber-700 font-semibold">⚠ REVIEW CAREFULLY. Uncomment COMMIT TRANSACTION only after verifying each statement.</p>
     </div>
-
-    <div class="p-4 max-h-96 overflow-y-auto scrollbar-thin">
-      <pre class="mono text-xs text-zinc-300 whitespace-pre-wrap leading-relaxed" x-text="bulkScript"></pre>
+    <div class="p-5 max-h-96 overflow-y-auto">
+      <pre class="mono text-xs text-stone-700 whitespace-pre-wrap leading-relaxed" x-text="bulkScript"></pre>
     </div>
-
-    <div class="flex items-center justify-end gap-2 px-5 py-3 border-t border-white/5 bg-surface-950/40">
-      <span x-show="bulkCopied" class="text-emerald-400 text-xs mr-auto">Copied!</span>
-      <button @click="copyBulk()"
-        class="px-4 py-2 bg-red-600 hover:bg-red-500 text-white text-xs font-medium rounded-lg transition">
-        Copy Script
-      </button>
-      <button @click="showBulkModal=false" class="px-4 py-2 bg-surface-800 hover:bg-zinc-700 text-zinc-300 text-xs font-medium rounded-lg transition">
-        Close
-      </button>
+    <div class="flex items-center justify-end gap-2 px-5 py-3 border-t border-stone-100 bg-stone-50">
+      <span x-show="bulkCopied" class="text-green-600 text-xs font-semibold mr-auto">Copied!</span>
+      <button @click="copyBulk()" class="px-4 py-2 bg-brand-600 hover:bg-brand-500 text-white text-xs font-semibold rounded-lg transition">Copy Script</button>
+      <button @click="showBulkModal=false" class="px-4 py-2 bg-stone-800 hover:bg-stone-700 text-white text-xs font-semibold rounded-lg transition">Close</button>
     </div>
   </div>
 </div>
 
-<!-- ── ALPINE.JS ───────────────────────────────────────────────────────────── -->
+<!-- ── ALPINE.JS ───────────────────────────────────────────────── -->
 <script>
 function dashboard() {
   return {
-    // Connection
     agentUrl:     localStorage.getItem('agentUrl') || 'http://localhost:8182',
     connected:    false,
     connecting:   false,
     connectError: '',
-    darkMode:     true,
 
-    // Data
     events:     [],
     stats:      { total:0, inserts:0, updates:0, deletes:0, databases:[], tables:[] },
     totalCount: 0,
 
-    // Pagination
     page:     1,
-    pageSize: 50,
+    pageSize: 20,
 
-    // Sorting
     sortCol: 'event_time',
     sortDir: 'desc',
 
-    // Filters
     filters: { db:'', table:'', op:'', from:'', to:'', search:'' },
 
-    // Selection
     selectedIds: [],
     selectedEvs: {},
 
-    // UI
     loading:       false,
     polling:       false,
     pollingTimer:  null,
@@ -463,42 +427,21 @@ function dashboard() {
     showBulkModal: false,
     bulkCopied:    false,
 
-    // ── Computed ──────────────────────────────────────────────────────────
     get totalPages()  { return Math.max(1, Math.ceil(this.totalCount / this.pageSize)) },
-    get pageInfo()    {
+    get pageInfo() {
       if (this.totalCount === 0) return 'No results';
       const s = ((this.page-1)*this.pageSize)+1;
       const e = Math.min(this.page*this.pageSize, this.totalCount);
-      return `Showing ${s.toLocaleString()}–${e.toLocaleString()} of ${this.totalCount.toLocaleString()}`;
+      return `${s.toLocaleString()}–${e.toLocaleString()} of ${this.totalCount.toLocaleString()}`;
     },
     get allSelected() { return this.events.length > 0 && this.selectedIds.length === this.events.length },
     get hasActiveFilters() {
       const f = this.filters;
-      return f.db || f.table || f.op || f.from || f.to || f.search;
-    },
-    get statCards() {
-      return [
-        { label:'Total',     value: this.stats.total    || 0, color:'text-white' },
-        { label:'INSERT',    value: this.stats.inserts  || 0, color:'text-emerald-400' },
-        { label:'UPDATE',    value: this.stats.updates  || 0, color:'text-blue-400' },
-        { label:'DELETE',    value: this.stats.deletes  || 0, color:'text-red-400' },
-        { label:'Tables',    value:(this.stats.tables   || []).length, color:'text-purple-400' },
-        { label:'Databases', value:(this.stats.databases|| []).length, color:'text-yellow-400' },
-      ]
-    },
-    get filteredTables() {
-      const ts = this.stats.tables || [];
-      if (!this.filters.db) return ts;
-      // Tables are returned as "schema.table" strings; no DB prefix → show all when DB filtered
-      return ts;
+      return !!(f.db || f.table || f.op || f.from || f.to || f.search);
     },
 
-    // ── Lifecycle ──────────────────────────────────────────────────────────
-    init() {
-      this.connect();
-    },
+    init() { this.connect(); },
 
-    // ── Connection ─────────────────────────────────────────────────────────
     async connect() {
       this.connecting  = true;
       this.connectError = '';
@@ -518,7 +461,6 @@ function dashboard() {
       }
     },
 
-    // ── Data loading ───────────────────────────────────────────────────────
     async loadEvents() {
       if (!this.connected) return;
       this.loading = true;
@@ -532,8 +474,8 @@ function dashboard() {
           table:  this.filters.table,
           op:     this.filters.op,
           search: this.filters.search,
-          since:  this.filters.from  ? new Date(this.filters.from).toISOString()  : '',
-          until:  this.filters.to    ? new Date(this.filters.to).toISOString()    : '',
+          since:  this.filters.from ? new Date(this.filters.from).toISOString() : '',
+          until:  this.filters.to   ? new Date(this.filters.to).toISOString()   : '',
         });
         const r = await fetch(`${this.agentUrl}/api/logs?${p}`);
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -554,9 +496,8 @@ function dashboard() {
       } catch {}
     },
 
-    // ── Polling ────────────────────────────────────────────────────────────
     startPolling() {
-      this.polling = true;
+      this.polling   = true;
       this.lastTotal = this.totalCount;
       this.pollingTimer = setInterval(async () => {
         await this.loadStats();
@@ -569,29 +510,13 @@ function dashboard() {
       }, 5000);
     },
 
-    stopPolling() {
-      this.polling = false;
-      if (this.pollingTimer) clearInterval(this.pollingTimer);
-    },
-
-    // ── Sorting ────────────────────────────────────────────────────────────
     sortBy(col) {
-      if (this.sortCol === col) {
-        this.sortDir = this.sortDir === 'desc' ? 'asc' : 'desc';
-      } else {
-        this.sortCol = col;
-        this.sortDir = 'desc';
-      }
+      if (this.sortCol === col) this.sortDir = this.sortDir === 'desc' ? 'asc' : 'desc';
+      else { this.sortCol = col; this.sortDir = 'desc'; }
       this.page = 1;
       this.loadEvents();
     },
 
-    sortIcon(col) {
-      if (this.sortCol !== col) return '↕';
-      return this.sortDir === 'desc' ? '↓' : '↑';
-    },
-
-    // ── Filters ────────────────────────────────────────────────────────────
     toggleOp(op) {
       this.filters.op = this.filters.op === op ? '' : op;
       this.resetAndLoad();
@@ -609,30 +534,18 @@ function dashboard() {
       this.loadEvents();
     },
 
-    // ── Pagination ─────────────────────────────────────────────────────────
-    prevPage() {
-      if (this.page > 1) { this.page--; this.loadEvents(); }
-    },
-    nextPage() {
-      if (this.page < this.totalPages) { this.page++; this.loadEvents(); }
-    },
+    prevPage() { if (this.page > 1)               { this.page--; this.loadEvents(); } },
+    nextPage() { if (this.page < this.totalPages)  { this.page++; this.loadEvents(); } },
 
-    // ── Selection ──────────────────────────────────────────────────────────
     toggleSelect(ev) {
       const idx = this.selectedIds.indexOf(ev.lsn);
-      if (idx >= 0) {
-        this.selectedIds.splice(idx, 1);
-        delete this.selectedEvs[ev.lsn];
-      } else {
-        this.selectedIds.push(ev.lsn);
-        this.selectedEvs[ev.lsn] = ev;
-      }
+      if (idx >= 0) { this.selectedIds.splice(idx, 1); delete this.selectedEvs[ev.lsn]; }
+      else          { this.selectedIds.push(ev.lsn);   this.selectedEvs[ev.lsn] = ev;   }
     },
 
     toggleSelectAll() {
       if (this.allSelected) {
-        this.selectedIds = [];
-        this.selectedEvs = {};
+        this.selectedIds = []; this.selectedEvs = {};
       } else {
         this.events.forEach(ev => {
           if (!this.selectedIds.includes(ev.lsn)) {
@@ -643,13 +556,22 @@ function dashboard() {
       }
     },
 
-    // ── Modal ──────────────────────────────────────────────────────────────
     showSQL(ev) {
-      this.modal = { show:true, title:`SQL — ${ev.operation} on ${ev.schema_name || ''}.${ev.table_name}`, sql: ev.sql_stmt || '-- No SQL available', isRollback:false, copied:false };
+      this.modal = {
+        show: true,
+        title: `SQL — ${ev.operation} · ${ev.schema_name||'dbo'}.${ev.table_name}`,
+        sql: ev.sql_stmt || '-- No SQL available',
+        isRollback: false, copied: false
+      };
     },
 
     showRollback(ev) {
-      this.modal = { show:true, title:`Rollback — ${ev.operation} on ${ev.schema_name || ''}.${ev.table_name}`, sql: ev.rollback_sql || '-- No rollback SQL available', isRollback:true, copied:false };
+      this.modal = {
+        show: true,
+        title: `Rollback — ${ev.operation} · ${ev.schema_name||'dbo'}.${ev.table_name}`,
+        sql: ev.rollback_sql || '-- No rollback SQL available',
+        isRollback: true, copied: false
+      };
     },
 
     copyModal() {
@@ -659,11 +581,10 @@ function dashboard() {
       });
     },
 
-    // ── Bulk rollback ──────────────────────────────────────────────────────
     generateBulkRollback() {
       const evs = Object.values(this.selectedEvs)
         .filter(ev => ev.rollback_sql && !ev.rollback_sql.startsWith('--'))
-        .sort((a, b) => (b.lsn > a.lsn ? 1 : -1)); // reverse LSN order
+        .sort((a, b) => b.lsn > a.lsn ? 1 : -1);
 
       const lines = [
         '-- ============================================================',
@@ -674,13 +595,11 @@ function dashboard() {
         '-- ⚠  REVIEW CAREFULLY BEFORE EXECUTING.',
         '-- ⚠  TEST ON A NON-PRODUCTION ENVIRONMENT FIRST.',
         '-- ============================================================',
-        '',
-        'BEGIN TRANSACTION;',
-        '',
+        '', 'BEGIN TRANSACTION;', '',
       ];
 
       evs.forEach((ev, i) => {
-        lines.push(`-- [${i+1}] LSN: ${ev.lsn}  TXN: ${ev.txn_id}  OP: ${ev.operation}  TABLE: ${ev.schema_name || ''}.${ev.table_name}`);
+        lines.push(`-- [${i+1}] LSN: ${ev.lsn}  TXN: ${ev.txn_id}  OP: ${ev.operation}  TABLE: ${ev.schema_name||''}.${ev.table_name}`);
         lines.push(ev.rollback_sql.trim());
         lines.push('');
       });
@@ -700,20 +619,18 @@ function dashboard() {
       });
     },
 
-    // ── Helpers ────────────────────────────────────────────────────────────
     truncSQL(sql) {
       if (!sql) return '';
       const s = sql.replace(/\s+/g, ' ').trim();
-      return s.length > 80 ? s.slice(0, 80) + '…' : s;
+      return s.length > 90 ? s.slice(0, 90) + '…' : s;
     },
 
     formatTime(ts) {
       if (!ts) return '—';
-      const d = new Date(ts);
-      const now = Date.now();
-      const diff = (now - d.getTime()) / 1000;
-      if (diff < 60)   return `${Math.floor(diff)}s ago`;
-      if (diff < 3600) return `${Math.floor(diff/60)}m ago`;
+      const d    = new Date(ts);
+      const diff = (Date.now() - d.getTime()) / 1000;
+      if (diff < 60)    return `${Math.floor(diff)}s ago`;
+      if (diff < 3600)  return `${Math.floor(diff/60)}m ago`;
       if (diff < 86400) return `${Math.floor(diff/3600)}h ago`;
       return d.toLocaleDateString(undefined, { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' });
     },
