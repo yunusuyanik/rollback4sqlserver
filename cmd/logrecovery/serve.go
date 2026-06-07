@@ -357,6 +357,9 @@ func handleScanRecord(
 
 	case logparser.OpCommitXact:
 		bt := beginTimes[rec.TransactionID]
+		if bt.IsZero() && rec.EndTime != "" {
+			bt = parseLogTime(rec.EndTime)
+		}
 		if !sinceTime.IsZero() && !bt.IsZero() && bt.Before(sinceTime) {
 			delete(pending, rec.TransactionID)
 			delete(beginTimes, rec.TransactionID)
@@ -825,18 +828,15 @@ func scanEventRows(rows *sql.Rows) []logEvent {
 }
 
 // GET /api/stats
+// Returns {total, inserts, updates, deletes, tables:[], databases:[]}
 func handleStats(w http.ResponseWriter, r *http.Request) {
 	appMu.RLock()
 	s := appStore
 	appMu.RUnlock()
 
-	type OpStat struct {
-		Operation string `json:"operation"`
-		Count     int    `json:"cnt"`
-	}
 	empty := map[string]interface{}{
-		"ops": []OpStat{}, "tables": 0,
-		"table_list": []string{}, "databases": []string{},
+		"total": 0, "inserts": 0, "updates": 0, "deletes": 0,
+		"tables": []string{}, "databases": []string{},
 	}
 	if s == nil {
 		writeJSON(w, empty)
@@ -844,27 +844,21 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 	conn := s.DB()
 
-	opRows, _ := conn.Query(
-		`SELECT operation, count(*) FROM log_events GROUP BY operation ORDER BY count(*) DESC`)
-	var ops []OpStat
+	opRows, _ := conn.Query(`SELECT operation, count(*) FROM log_events GROUP BY operation`)
+	counts := map[string]int{}
+	total := 0
 	if opRows != nil {
 		defer opRows.Close()
 		for opRows.Next() {
-			var st OpStat
-			opRows.Scan(&st.Operation, &st.Count)
-			ops = append(ops, st)
+			var op string
+			var cnt int
+			opRows.Scan(&op, &cnt)
+			counts[op] = cnt
+			total += cnt
 		}
 	}
-	if ops == nil {
-		ops = []OpStat{}
-	}
 
-	var tableCount int
-	conn.QueryRow(
-		`SELECT count(DISTINCT db_name || '.' || schema_name || '.' || table_name) FROM log_events`).Scan(&tableCount)
-
-	tblRows, _ := conn.Query(
-		`SELECT DISTINCT schema_name || '.' || table_name AS t FROM log_events ORDER BY t`)
+	tblRows, _ := conn.Query(`SELECT DISTINCT schema_name || '.' || table_name AS t FROM log_events ORDER BY t`)
 	var tableList []string
 	if tblRows != nil {
 		defer tblRows.Close()
@@ -878,8 +872,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		tableList = []string{}
 	}
 
-	dbRows, _ := conn.Query(
-		`SELECT DISTINCT db_name FROM log_events WHERE db_name IS NOT NULL AND db_name != '' ORDER BY db_name`)
+	dbRows, _ := conn.Query(`SELECT DISTINCT db_name FROM log_events WHERE db_name IS NOT NULL AND db_name != '' ORDER BY db_name`)
 	var dbList []string
 	if dbRows != nil {
 		defer dbRows.Close()
@@ -894,8 +887,12 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, map[string]interface{}{
-		"ops": ops, "tables": tableCount,
-		"table_list": tableList, "databases": dbList,
+		"total":     total,
+		"inserts":   counts["INSERT"],
+		"updates":   counts["UPDATE"],
+		"deletes":   counts["DELETE"],
+		"tables":    tableList,
+		"databases": dbList,
 	})
 }
 
