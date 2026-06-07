@@ -43,6 +43,19 @@ tailwind.config = {
   .event-row .row-actions { opacity: 0; transition: opacity 0.12s; }
   .event-row:hover .row-actions,
   .event-row.ev-selected .row-actions { opacity: 1; }
+
+  @keyframes newRow {
+    0%   { background-color: rgba(220,38,38,0.10); }
+    60%  { background-color: rgba(220,38,38,0.06); }
+    100% { background-color: transparent; }
+  }
+  .ev-new { animation: newRow 2.5s ease-out forwards; }
+
+  @keyframes dotPing {
+    0%, 100% { transform: scale(1); opacity: 1; }
+    50%       { transform: scale(1.8); opacity: 0.4; }
+  }
+  .ev-new .ev-dot { animation: dotPing 0.7s ease-in-out 3; }
 </style>
 </head>
 <body class="text-stone-900 font-sans antialiased min-h-screen"
@@ -53,7 +66,10 @@ tailwind.config = {
   <div class="max-w-screen-xl mx-auto px-5 h-14 flex items-center gap-4">
 
     <a href="./index.html" class="flex items-center gap-1.5 shrink-0">
-      <span class="text-brand-600 font-mono font-bold text-lg leading-none">⟲</span>
+      <svg class="w-5 h-5 text-brand-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
+        <path stroke-linecap="round" stroke-linejoin="round" d="M7.5 10.5L5 12l2.5 1.5"/>
+      </svg>
       <span class="text-sm font-semibold tracking-tight text-stone-900">rollback4sqlserver</span>
       <span class="text-stone-400 text-xs hidden sm:inline">by dbaops</span>
     </a>
@@ -214,6 +230,42 @@ tailwind.config = {
       </button>
     </div>
 
+    <!-- TIMELINE -->
+    <div x-show="events.length > 0" class="bg-white border border-stone-200 rounded-xl px-5 py-3 mb-3 shadow-sm">
+      <div class="flex items-center gap-3">
+        <span class="text-[10px] font-bold uppercase tracking-widest text-stone-400 shrink-0">Timeline</span>
+        <div class="flex-1 relative h-5">
+          <!-- track -->
+          <div class="absolute top-1/2 left-0 right-6 h-px bg-stone-200"></div>
+          <!-- event dots -->
+          <template x-if="timelineRange">
+            <template x-for="ev in timelineEvents" :key="ev.lsn">
+              <div class="absolute w-2.5 h-2.5 rounded-full -translate-x-1/2 -translate-y-1/2 top-1/2 cursor-default border-2 border-white shadow-sm transition-transform hover:scale-150"
+                :style="`left: calc(${tlPosX(ev.t)} * (100% - 1.5rem))`"
+                :class="{
+                  'bg-green-500':  ev.op === 'INSERT',
+                  'bg-red-600':    ev.op === 'DELETE',
+                  'bg-amber-500':  ev.op === 'UPDATE',
+                  'bg-stone-400':  !['INSERT','UPDATE','DELETE'].includes(ev.op),
+                  'ring-2 ring-brand-400 ring-offset-1 scale-125': newLsns.includes(ev.lsn)
+                }"
+                :title="`${ev.op} · ${ev.table} · ${ev.timeLabel}`">
+              </div>
+            </template>
+          </template>
+          <!-- NOW marker -->
+          <div class="absolute right-0 top-1/2 -translate-y-1/2 flex flex-col items-center gap-0.5">
+            <div class="w-0.5 h-3.5 bg-stone-400 rounded-full"></div>
+          </div>
+        </div>
+        <span class="text-[10px] text-stone-400 mono shrink-0">NOW</span>
+      </div>
+      <div class="flex justify-between mt-1 text-[9px] text-stone-300 mono px-0" x-show="timelineRange">
+        <span x-text="timelineRange ? fmtTlTime(timelineRange.min) : ''"></span>
+        <span x-text="timelineRange ? fmtTlTime(timelineRange.max) : ''"></span>
+      </div>
+    </div>
+
     <!-- EVENT FEED -->
     <div class="bg-white border border-stone-200 rounded-xl overflow-hidden mb-3 shadow-sm">
 
@@ -257,14 +309,14 @@ tailwind.config = {
         <!-- Rows -->
         <template x-for="ev in events" :key="ev.lsn + ev.txn_id">
           <div class="event-row flex items-start gap-4 px-5 py-3.5 border-b border-stone-100 transition-colors"
-               :class="selectedIds.includes(ev.lsn) ? 'bg-brand-50/50 ev-selected' : 'hover:bg-stone-50/70'">
+               :class="newLsns.includes(ev.lsn) ? 'ev-new ev-selected' : selectedIds.includes(ev.lsn) ? 'bg-brand-50/50 ev-selected' : 'hover:bg-stone-50/70'">
 
             <!-- Checkbox -->
             <input type="checkbox" class="rounded border-stone-300 accent-brand-600 mt-0.5 shrink-0"
               :checked="selectedIds.includes(ev.lsn)" @change="toggleSelect(ev)">
 
             <!-- Op dot -->
-            <div class="w-2.5 h-2.5 rounded-full mt-2 shrink-0"
+            <div class="ev-dot w-2.5 h-2.5 rounded-full mt-2 shrink-0"
               :class="{
                 'bg-green-500':  ev.operation === 'INSERT',
                 'bg-red-600':    ev.operation === 'DELETE',
@@ -422,6 +474,7 @@ function dashboard() {
     polling:       false,
     pollingTimer:  null,
     lastTotal:     0,
+    newLsns:       [],
     modal:         { show:false, title:'', sql:'', isRollback:false, copied:false },
     bulkScript:    '',
     showBulkModal: false,
@@ -438,6 +491,35 @@ function dashboard() {
     get hasActiveFilters() {
       const f = this.filters;
       return !!(f.db || f.table || f.op || f.from || f.to || f.search);
+    },
+
+    // Timeline
+    get timelineEvents() {
+      return this.events
+        .filter(ev => ev.event_time)
+        .map(ev => ({
+          lsn:       ev.lsn,
+          op:        ev.operation,
+          table:     (ev.schema_name||'dbo') + '.' + (ev.table_name||''),
+          t:         new Date(ev.event_time).getTime(),
+          timeLabel: new Date(ev.event_time).toLocaleTimeString(),
+        }));
+    },
+    get timelineRange() {
+      const ts = this.timelineEvents.map(e => e.t);
+      if (ts.length === 0) return null;
+      const now = Date.now();
+      const min = Math.min(...ts);
+      const max = Math.max(now, ...ts);
+      return min === max ? null : { min, max };
+    },
+    tlPosX(t) {
+      const r = this.timelineRange;
+      if (!r) return 0;
+      return (t - r.min) / (r.max - r.min);
+    },
+    fmtTlTime(ts) {
+      return new Date(ts).toLocaleTimeString(undefined, { hour:'2-digit', minute:'2-digit', second:'2-digit' });
     },
 
     init() { this.connect(); },
@@ -504,8 +586,17 @@ function dashboard() {
         const newTotal = this.stats.total || 0;
         if (newTotal !== this.lastTotal) {
           this.lastTotal = newTotal;
-          if (this.page === 1) await this.loadEvents();
-          else this.totalCount = newTotal;
+          if (this.page === 1) {
+            const oldLsns = new Set(this.events.map(e => e.lsn));
+            await this.loadEvents();
+            const fresh = this.events.filter(e => !oldLsns.has(e.lsn)).map(e => e.lsn);
+            if (fresh.length) {
+              this.newLsns = fresh;
+              setTimeout(() => { this.newLsns = []; }, 3000);
+            }
+          } else {
+            this.totalCount = newTotal;
+          }
         }
       }, 5000);
     },

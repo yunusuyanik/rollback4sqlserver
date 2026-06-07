@@ -21,12 +21,12 @@
     }
   </script>
   <style>
-    body { background: #f8f7f3; color: #1c1917; font-family: 'Inter', sans-serif; }
+    body { background: #ffffff; color: #1c1917; font-family: 'Inter', sans-serif; }
     .gradient-text { background: linear-gradient(135deg, #1c1917 0%, #dc2626 55%, #b91c1c 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
-    .hero-glow { background: radial-gradient(ellipse 80% 50% at 50% -20%, rgba(220,38,38,0.10) 0%, transparent 70%); }
-    .card { background: #ffffff; border: 1px solid #e5e2d9; }
-    .card:hover { border-color: #c9c5bc; }
-    .code-block { background: #efece7; border: 1px solid #ddd9cf; font-family: 'JetBrains Mono', monospace; }
+    .hero-glow { background: radial-gradient(ellipse 80% 50% at 50% -20%, rgba(220,38,38,0.08) 0%, transparent 70%); }
+    .card { background: #fafafa; border: 1px solid #ebebeb; }
+    .card:hover { border-color: #d4d4d4; box-shadow: 0 1px 6px rgba(0,0,0,0.06); }
+    .code-block { background: #f5f5f5; border: 1px solid #e5e5e5; font-family: 'JetBrains Mono', monospace; }
     .step-num { background: linear-gradient(135deg, #dc2626, #b91c1c); }
     nav a, nav button { transition: all 0.15s; }
   </style>
@@ -34,10 +34,13 @@
 <body>
 
 <!-- ── NAV ──────────────────────────────────────────────────── -->
-<nav class="fixed top-0 left-0 right-0 z-50 border-b border-stone-200 backdrop-blur-md" style="background:rgba(248,247,243,0.92)">
+<nav class="fixed top-0 left-0 right-0 z-50 border-b border-stone-200 backdrop-blur-md" style="background:rgba(255,255,255,0.95)">
   <div class="max-w-6xl mx-auto px-6 h-14 flex items-center justify-between">
     <div class="flex items-center gap-2">
-      <span class="text-brand-600 font-mono font-bold text-lg">⟲</span>
+      <svg class="w-5 h-5 text-brand-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
+        <path stroke-linecap="round" stroke-linejoin="round" d="M7.5 10.5L5 12l2.5 1.5"/>
+      </svg>
       <span class="font-semibold text-sm tracking-tight text-stone-900">rollback4sqlserver</span>
       <span class="text-stone-400 text-xs ml-1">by dbaops</span>
     </div>
@@ -278,7 +281,10 @@
 <footer class="border-t border-stone-200 py-8 px-6">
   <div class="max-w-6xl mx-auto flex items-center justify-center">
     <div class="flex items-center gap-2 text-stone-400 text-sm">
-      <span class="text-brand-600 font-mono font-bold">⟲</span>
+      <svg class="w-4 h-4 text-brand-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
+        <path stroke-linecap="round" stroke-linejoin="round" d="M7.5 10.5L5 12l2.5 1.5"/>
+      </svg>
       <span>rollback4sqlserver</span>
       <span class="text-stone-300">·</span>
       <span>by dbaops</span>
