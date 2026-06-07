@@ -1,0 +1,724 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rollback4sqlserver — Dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+  darkMode: 'class',
+  theme: {
+    extend: {
+      colors: {
+        surface: { 800:'#18181b', 900:'#111113', 950:'#09090b' }
+      },
+      fontFamily: { sans:['Inter','system-ui','sans-serif'], mono:['JetBrains Mono','monospace'] }
+    }
+  }
+}
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+<style>
+  [x-cloak]{display:none!important}
+  .mono{font-family:'JetBrains Mono',monospace}
+  .op-INSERT{@apply bg-emerald-500/10 text-emerald-400 border border-emerald-500/20}
+  .op-UPDATE{@apply bg-blue-500/10 text-blue-400 border border-blue-500/20}
+  .op-DELETE{@apply bg-red-500/10 text-red-400 border border-red-500/20}
+  .op-other{@apply bg-zinc-500/10 text-zinc-400 border border-zinc-500/20}
+  .scrollbar-thin::-webkit-scrollbar{width:4px;height:4px}
+  .scrollbar-thin::-webkit-scrollbar-track{background:transparent}
+  .scrollbar-thin::-webkit-scrollbar-thumb{background:#3f3f46;border-radius:2px}
+  th.sortable{cursor:pointer;user-select:none}
+  th.sortable:hover{color:#e4e4e7}
+  tr.sel{background:rgba(220,38,38,.06)!important}
+</style>
+</head>
+<body class="dark bg-surface-950 text-zinc-200 font-sans antialiased min-h-screen"
+  x-data="dashboard()" x-init="init()">
+
+<!-- ── HEADER ─────────────────────────────────────────────────────────────── -->
+<header class="sticky top-0 z-30 border-b border-white/5 bg-surface-900/80 backdrop-blur">
+  <div class="max-w-screen-2xl mx-auto px-4 h-13 flex items-center gap-3 h-14">
+
+    <a href="./index.html" class="flex items-center gap-2 shrink-0 group">
+      <svg class="w-5 h-5 text-red-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
+        <path stroke-linecap="round" stroke-linejoin="round" d="M7.5 10.5L5 12l2.5 1.5"/>
+      </svg>
+      <span class="text-sm font-semibold text-white tracking-tight">rollback<span class="text-red-500">4sqlserver</span></span>
+    </a>
+
+    <div class="w-px h-5 bg-white/10 shrink-0"></div>
+
+    <!-- Agent URL -->
+    <div class="flex items-center gap-2 flex-1 max-w-xs">
+      <span class="text-[11px] text-zinc-600 shrink-0 font-medium">Agent</span>
+      <input x-model="agentUrl" @keydown.enter="connect()"
+        class="flex-1 min-w-0 bg-white/5 border border-white/10 rounded-md px-2.5 py-1.5 text-[11px] mono text-zinc-300
+               focus:outline-none focus:border-red-500/50 focus:ring-1 focus:ring-red-500/20 transition"
+        placeholder="http://localhost:8182">
+      <button @click="connect()"
+        :class="connected
+          ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500/15'
+          : 'bg-red-600 text-white hover:bg-red-500'"
+        class="shrink-0 px-3 py-1.5 rounded-md text-[11px] font-medium transition">
+        <span x-text="connected ? '● Live' : connecting ? '…' : 'Connect'"></span>
+      </button>
+    </div>
+
+    <div class="flex-1"></div>
+
+    <!-- Live + event count -->
+    <div x-show="connected" x-cloak class="flex items-center gap-4 text-[11px] text-zinc-600">
+      <span x-show="polling" class="flex items-center gap-1.5">
+        <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+        polling
+      </span>
+      <span x-text="totalCount.toLocaleString() + ' events'"></span>
+    </div>
+
+    <!-- Dark mode -->
+    <button @click="$el.closest('html').classList.toggle('dark'); darkMode=!darkMode"
+      class="p-1.5 rounded-md text-zinc-600 hover:text-zinc-300 hover:bg-white/5 transition">
+      <svg x-show="darkMode" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M12 3v1m0 16v1m8.66-9h-1M4.34 12h-1m15.07-6.36-.7.7M6.3 17.66l-.7.7m12.02 0-.7-.7M6.3 6.34l-.7-.7M12 8a4 4 0 100 8 4 4 0 000-8z"/>
+      </svg>
+      <svg x-show="!darkMode" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/>
+      </svg>
+    </button>
+  </div>
+</header>
+
+<!-- ── MAIN ───────────────────────────────────────────────────────────────── -->
+<main class="max-w-screen-2xl mx-auto px-4 py-5">
+
+  <!-- ── NOT CONNECTED ── -->
+  <div x-show="!connected" x-cloak class="flex flex-col items-center justify-center py-32 gap-5 text-center">
+    <div class="w-14 h-14 rounded-2xl bg-red-500/10 border border-red-500/20 flex items-center justify-center">
+      <svg class="w-7 h-7 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M5.636 5.636a9 9 0 1012.728 12.728M5.636 5.636A9 9 0 0118.364 18.364M5.636 5.636L3 3m15.364 15.364L21 21"/>
+      </svg>
+    </div>
+    <div>
+      <p class="font-semibold text-white text-lg mb-1">Connect to Local Agent</p>
+      <p class="text-zinc-500 text-sm max-w-sm">Start <span class="mono text-zinc-400">logrecovery.exe serve</span> on your SQL Server host, then enter its URL above and click Connect.</p>
+    </div>
+    <div class="bg-surface-900 border border-white/5 rounded-xl p-4 text-left max-w-md w-full">
+      <p class="text-[10px] text-zinc-600 mb-2 font-semibold uppercase tracking-wider">Quick start</p>
+      <pre class="mono text-xs text-zinc-400 leading-relaxed whitespace-pre-wrap">.\logrecovery.exe serve ^
+  --host ".\SQLEXPRESS" ^
+  --user sa --pass *** ^
+  --all-dbs --since 24h</pre>
+    </div>
+    <p x-show="connectError" x-text="connectError" class="text-red-400 text-xs max-w-sm"></p>
+  </div>
+
+  <!-- ── CONNECTED ── -->
+  <div x-show="connected" x-cloak>
+
+    <!-- STATS ROW -->
+    <div class="grid grid-cols-3 sm:grid-cols-6 gap-2.5 mb-4">
+      <template x-for="s in statCards" :key="s.label">
+        <div class="bg-surface-900 border border-white/5 rounded-xl px-4 py-3 hover:border-white/10 transition">
+          <p class="text-[10px] text-zinc-600 font-medium uppercase tracking-wider mb-1" x-text="s.label"></p>
+          <p class="text-xl font-bold" :class="s.color" x-text="s.value.toLocaleString()"></p>
+        </div>
+      </template>
+    </div>
+
+    <!-- FILTERS -->
+    <div class="bg-surface-900 border border-white/5 rounded-xl p-3 mb-3 flex flex-wrap gap-2 items-center">
+
+      <!-- Operation toggles -->
+      <div class="flex items-center gap-1">
+        <template x-for="op in ['INSERT','UPDATE','DELETE']" :key="op">
+          <button @click="toggleOp(op)"
+            :class="filters.op === op
+              ? (op==='INSERT' ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
+                : op==='UPDATE' ? 'bg-blue-500/15 text-blue-400 border-blue-500/30'
+                : 'bg-red-500/15 text-red-400 border-red-500/30')
+              : 'bg-surface-950 text-zinc-500 border-white/8 hover:text-zinc-300 hover:border-white/15'"
+            class="px-2.5 py-1.5 rounded-lg text-xs font-medium border transition"
+            x-text="op">
+          </button>
+        </template>
+      </div>
+
+      <div class="w-px h-5 bg-white/8 shrink-0"></div>
+
+      <!-- Database -->
+      <select x-model="filters.db" @change="resetAndLoad()"
+        class="bg-surface-950 border border-white/8 rounded-lg px-2.5 py-1.5 text-xs text-zinc-300 focus:outline-none focus:border-red-500/40 min-w-[120px]">
+        <option value="">All databases</option>
+        <template x-for="d in stats.databases" :key="d">
+          <option :value="d" x-text="d"></option>
+        </template>
+      </select>
+
+      <!-- Table -->
+      <select x-model="filters.table" @change="resetAndLoad()"
+        class="bg-surface-950 border border-white/8 rounded-lg px-2.5 py-1.5 text-xs text-zinc-300 focus:outline-none focus:border-red-500/40 min-w-[140px]">
+        <option value="">All tables</option>
+        <template x-for="t in filteredTables" :key="t">
+          <option :value="t" x-text="t"></option>
+        </template>
+      </select>
+
+      <div class="w-px h-5 bg-white/8 shrink-0"></div>
+
+      <!-- Time range -->
+      <div class="flex items-center gap-1.5">
+        <input x-model="filters.from" @change="resetAndLoad()" type="datetime-local"
+          class="bg-surface-950 border border-white/8 rounded-lg px-2.5 py-1.5 text-xs text-zinc-300 focus:outline-none focus:border-red-500/40"
+          title="From date/time">
+        <span class="text-zinc-700 text-xs">–</span>
+        <input x-model="filters.to" @change="resetAndLoad()" type="datetime-local"
+          class="bg-surface-950 border border-white/8 rounded-lg px-2.5 py-1.5 text-xs text-zinc-300 focus:outline-none focus:border-red-500/40"
+          title="To date/time">
+      </div>
+
+      <div class="w-px h-5 bg-white/8 shrink-0"></div>
+
+      <!-- Search -->
+      <div class="relative flex-1 min-w-[160px]">
+        <svg class="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-600 pointer-events-none" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+        </svg>
+        <input x-model="filters.search" @input.debounce.400ms="resetAndLoad()" type="text" placeholder="Search SQL…"
+          class="w-full bg-surface-950 border border-white/8 rounded-lg pl-8 pr-3 py-1.5 text-xs text-zinc-300 focus:outline-none focus:border-red-500/40 placeholder-zinc-700">
+      </div>
+
+      <!-- Clear filters -->
+      <button x-show="hasActiveFilters" @click="clearFilters()"
+        class="text-xs text-zinc-500 hover:text-zinc-300 px-2 py-1.5 rounded-lg hover:bg-white/5 transition">
+        Clear
+      </button>
+    </div>
+
+    <!-- BULK ACTION BAR -->
+    <div x-show="selectedIds.length > 0" x-cloak
+      class="bg-red-950/40 border border-red-500/20 rounded-xl px-4 py-2.5 mb-3 flex items-center gap-3">
+      <span class="text-red-400 text-xs font-medium" x-text="selectedIds.length + ' event(s) selected'"></span>
+      <button @click="generateBulkRollback()"
+        class="px-3 py-1.5 bg-red-600 hover:bg-red-500 text-white text-xs font-medium rounded-lg transition flex items-center gap-1.5">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+        </svg>
+        Generate Rollback Script
+      </button>
+      <button @click="selectedIds = []" class="ml-auto text-zinc-600 hover:text-zinc-400 text-xs transition">Deselect all</button>
+    </div>
+
+    <!-- TABLE -->
+    <div class="bg-surface-900 border border-white/5 rounded-xl overflow-hidden mb-3">
+      <div class="overflow-x-auto scrollbar-thin">
+        <table class="w-full text-xs">
+          <thead>
+            <tr class="border-b border-white/5">
+              <th class="w-8 px-3 py-2.5 text-left">
+                <input type="checkbox" class="rounded border-white/20 bg-transparent accent-red-500"
+                  :checked="allSelected" @change="toggleSelectAll()" :indeterminate.prop="selectedIds.length > 0 && !allSelected">
+              </th>
+              <th class="sortable px-3 py-2.5 text-left text-[10px] font-semibold uppercase tracking-wider text-zinc-600" @click="sortBy('event_time')">
+                <span class="flex items-center gap-1">Time <span x-text="sortIcon('event_time')"></span></span>
+              </th>
+              <th class="sortable px-3 py-2.5 text-left text-[10px] font-semibold uppercase tracking-wider text-zinc-600" @click="sortBy('operation')">
+                <span class="flex items-center gap-1">Op <span x-text="sortIcon('operation')"></span></span>
+              </th>
+              <th class="sortable px-3 py-2.5 text-left text-[10px] font-semibold uppercase tracking-wider text-zinc-600" @click="sortBy('db_name')">
+                <span class="flex items-center gap-1">Database <span x-text="sortIcon('db_name')"></span></span>
+              </th>
+              <th class="sortable px-3 py-2.5 text-left text-[10px] font-semibold uppercase tracking-wider text-zinc-600" @click="sortBy('table_name')">
+                <span class="flex items-center gap-1">Table <span x-text="sortIcon('table_name')"></span></span>
+              </th>
+              <th class="px-3 py-2.5 text-left text-[10px] font-semibold uppercase tracking-wider text-zinc-600">SQL Preview</th>
+              <th class="sortable px-3 py-2.5 text-left text-[10px] font-semibold uppercase tracking-wider text-zinc-600" @click="sortBy('lsn')">
+                <span class="flex items-center gap-1">LSN <span x-text="sortIcon('lsn')"></span></span>
+              </th>
+              <th class="w-20 px-3 py-2.5 text-right text-[10px] font-semibold uppercase tracking-wider text-zinc-600">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <!-- Loading skeleton -->
+            <template x-if="loading">
+              <template x-for="i in 8" :key="i">
+                <tr class="border-b border-white/3">
+                  <td class="px-3 py-2.5"><div class="w-4 h-4 bg-white/5 rounded"></div></td>
+                  <td class="px-3 py-2.5"><div class="w-24 h-3 bg-white/5 rounded animate-pulse"></div></td>
+                  <td class="px-3 py-2.5"><div class="w-14 h-5 bg-white/5 rounded animate-pulse"></div></td>
+                  <td class="px-3 py-2.5"><div class="w-20 h-3 bg-white/5 rounded animate-pulse"></div></td>
+                  <td class="px-3 py-2.5"><div class="w-24 h-3 bg-white/5 rounded animate-pulse"></div></td>
+                  <td class="px-3 py-2.5"><div class="w-48 h-3 bg-white/5 rounded animate-pulse"></div></td>
+                  <td class="px-3 py-2.5"><div class="w-32 h-3 bg-white/5 rounded animate-pulse"></div></td>
+                  <td class="px-3 py-2.5"></td>
+                </tr>
+              </template>
+            </template>
+
+            <!-- Empty state -->
+            <template x-if="!loading && events.length === 0">
+              <tr>
+                <td colspan="8" class="px-3 py-14 text-center text-zinc-600 text-xs">No events found.</td>
+              </tr>
+            </template>
+
+            <!-- Data rows -->
+            <template x-if="!loading">
+              <template x-for="ev in events" :key="ev.lsn + ev.txn_id">
+                <tr class="border-b border-white/3 hover:bg-white/2 transition-colors"
+                  :class="selectedIds.includes(ev.lsn) ? 'sel' : ''">
+                  <td class="px-3 py-2">
+                    <input type="checkbox" class="rounded border-white/20 bg-transparent accent-red-500"
+                      :checked="selectedIds.includes(ev.lsn)"
+                      @change="toggleSelect(ev)">
+                  </td>
+                  <td class="px-3 py-2 text-zinc-500 mono whitespace-nowrap" x-text="formatTime(ev.event_time)"></td>
+                  <td class="px-3 py-2">
+                    <span class="px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wide"
+                      :class="'op-' + ev.operation" x-text="ev.operation"></span>
+                  </td>
+                  <td class="px-3 py-2 text-zinc-400 truncate max-w-[100px]" x-text="ev.db_name || '—'"></td>
+                  <td class="px-3 py-2 text-zinc-300 truncate max-w-[130px] font-medium"
+                    x-text="ev.schema_name && ev.table_name ? ev.schema_name+'.'+ev.table_name : ev.table_name || '—'"></td>
+                  <td class="px-3 py-2 max-w-xs">
+                    <span class="mono text-zinc-500 truncate block max-w-xs" x-text="truncSQL(ev.sql_stmt)"></span>
+                  </td>
+                  <td class="px-3 py-2 mono text-zinc-700 text-[10px] whitespace-nowrap" x-text="ev.lsn"></td>
+                  <td class="px-3 py-2 text-right">
+                    <div class="flex items-center justify-end gap-1">
+                      <button @click="showSQL(ev)" title="View SQL"
+                        class="p-1.5 rounded-md text-zinc-600 hover:text-zinc-300 hover:bg-white/5 transition">
+                        <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                          <path stroke-linecap="round" stroke-linejoin="round" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"/>
+                        </svg>
+                      </button>
+                      <button x-show="ev.rollback_sql" @click="showRollback(ev)" title="Rollback SQL"
+                        class="p-1.5 rounded-md text-zinc-600 hover:text-red-400 hover:bg-red-500/10 transition">
+                        <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                          <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+                        </svg>
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              </template>
+            </template>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- PAGINATION FOOTER -->
+      <div class="px-4 py-2.5 border-t border-white/5 flex flex-wrap items-center gap-3 bg-surface-950/40">
+
+        <!-- Page size -->
+        <div class="flex items-center gap-1.5">
+          <span class="text-[10px] text-zinc-600">Show</span>
+          <select x-model.number="pageSize" @change="page=1; loadEvents()"
+            class="bg-surface-900 border border-white/8 rounded-md px-2 py-1 text-[11px] text-zinc-400 focus:outline-none">
+            <option value="25">25</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+            <option value="200">200</option>
+          </select>
+        </div>
+
+        <!-- Page info -->
+        <span class="text-[11px] text-zinc-500 flex-1 text-center" x-text="pageInfo"></span>
+
+        <!-- Prev / Next -->
+        <div class="flex items-center gap-1">
+          <button @click="prevPage()" :disabled="page <= 1"
+            class="px-2.5 py-1.5 rounded-md text-xs font-medium border border-white/8 text-zinc-500 hover:text-zinc-300 hover:border-white/15 disabled:opacity-30 disabled:cursor-not-allowed transition">
+            ← Prev
+          </button>
+          <span class="px-2 text-[11px] text-zinc-600" x-text="'Page ' + page + ' / ' + totalPages"></span>
+          <button @click="nextPage()" :disabled="page >= totalPages"
+            class="px-2.5 py-1.5 rounded-md text-xs font-medium border border-white/8 text-zinc-500 hover:text-zinc-300 hover:border-white/15 disabled:opacity-30 disabled:cursor-not-allowed transition">
+            Next →
+          </button>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /connected -->
+</main>
+
+<!-- ── SQL MODAL ──────────────────────────────────────────────────────────── -->
+<div x-show="modal.show" x-cloak @click.self="modal.show=false"
+  class="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-end sm:items-center justify-center p-4">
+  <div class="w-full max-w-2xl bg-surface-900 border border-white/10 rounded-2xl overflow-hidden shadow-2xl" @click.stop>
+
+    <div class="flex items-center justify-between px-5 py-3.5 border-b border-white/5">
+      <div class="flex items-center gap-2.5">
+        <span class="w-2 h-2 rounded-full" :class="modal.isRollback ? 'bg-red-500' : 'bg-blue-500'"></span>
+        <h3 class="font-semibold text-sm text-white" x-text="modal.title"></h3>
+      </div>
+      <button @click="modal.show=false" class="text-zinc-600 hover:text-zinc-300 transition">
+        <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/>
+        </svg>
+      </button>
+    </div>
+
+    <div x-show="modal.isRollback" class="px-5 py-2.5 bg-red-950/30 border-b border-red-900/30">
+      <p class="text-[11px] text-red-400 font-medium">⚠ Review this SQL carefully before executing. Test on a non-production environment first.</p>
+    </div>
+
+    <div class="p-4 max-h-80 overflow-y-auto scrollbar-thin">
+      <pre class="mono text-xs text-zinc-300 whitespace-pre-wrap leading-relaxed" x-text="modal.sql"></pre>
+    </div>
+
+    <div class="flex items-center justify-end gap-2 px-5 py-3 border-t border-white/5 bg-surface-950/40">
+      <span x-show="modal.copied" class="text-emerald-400 text-xs mr-auto">Copied!</span>
+      <button @click="copyModal()" class="px-4 py-2 bg-white/8 hover:bg-white/12 text-zinc-300 text-xs font-medium rounded-lg transition">
+        Copy
+      </button>
+      <button @click="modal.show=false" class="px-4 py-2 bg-surface-800 hover:bg-zinc-700 text-zinc-300 text-xs font-medium rounded-lg transition">
+        Close
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- ── BULK ROLLBACK MODAL ─────────────────────────────────────────────────── -->
+<div x-show="showBulkModal" x-cloak @click.self="showBulkModal=false"
+  class="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-end sm:items-center justify-center p-4">
+  <div class="w-full max-w-2xl bg-surface-900 border border-white/10 rounded-2xl overflow-hidden shadow-2xl" @click.stop>
+
+    <div class="flex items-center justify-between px-5 py-3.5 border-b border-white/5">
+      <div class="flex items-center gap-2.5">
+        <span class="w-2 h-2 rounded-full bg-red-500"></span>
+        <h3 class="font-semibold text-sm text-white" x-text="'Bulk Rollback Script (' + selectedIds.length + ' events)'"></h3>
+      </div>
+      <button @click="showBulkModal=false" class="text-zinc-600 hover:text-zinc-300 transition">
+        <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/>
+        </svg>
+      </button>
+    </div>
+
+    <div class="px-5 py-2.5 bg-red-950/30 border-b border-red-900/30">
+      <p class="text-[11px] text-red-400 font-medium">⚠ REVIEW CAREFULLY. Uncomment COMMIT TRANSACTION only after verifying each statement.</p>
+    </div>
+
+    <div class="p-4 max-h-96 overflow-y-auto scrollbar-thin">
+      <pre class="mono text-xs text-zinc-300 whitespace-pre-wrap leading-relaxed" x-text="bulkScript"></pre>
+    </div>
+
+    <div class="flex items-center justify-end gap-2 px-5 py-3 border-t border-white/5 bg-surface-950/40">
+      <span x-show="bulkCopied" class="text-emerald-400 text-xs mr-auto">Copied!</span>
+      <button @click="copyBulk()"
+        class="px-4 py-2 bg-red-600 hover:bg-red-500 text-white text-xs font-medium rounded-lg transition">
+        Copy Script
+      </button>
+      <button @click="showBulkModal=false" class="px-4 py-2 bg-surface-800 hover:bg-zinc-700 text-zinc-300 text-xs font-medium rounded-lg transition">
+        Close
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- ── ALPINE.JS ───────────────────────────────────────────────────────────── -->
+<script>
+function dashboard() {
+  return {
+    // Connection
+    agentUrl:     localStorage.getItem('agentUrl') || 'http://localhost:8182',
+    connected:    false,
+    connecting:   false,
+    connectError: '',
+    darkMode:     true,
+
+    // Data
+    events:     [],
+    stats:      { total:0, inserts:0, updates:0, deletes:0, databases:[], tables:[] },
+    totalCount: 0,
+
+    // Pagination
+    page:     1,
+    pageSize: 50,
+
+    // Sorting
+    sortCol: 'event_time',
+    sortDir: 'desc',
+
+    // Filters
+    filters: { db:'', table:'', op:'', from:'', to:'', search:'' },
+
+    // Selection
+    selectedIds: [],
+    selectedEvs: {},
+
+    // UI
+    loading:       false,
+    polling:       false,
+    pollingTimer:  null,
+    lastTotal:     0,
+    modal:         { show:false, title:'', sql:'', isRollback:false, copied:false },
+    bulkScript:    '',
+    showBulkModal: false,
+    bulkCopied:    false,
+
+    // ── Computed ──────────────────────────────────────────────────────────
+    get totalPages()  { return Math.max(1, Math.ceil(this.totalCount / this.pageSize)) },
+    get pageInfo()    {
+      if (this.totalCount === 0) return 'No results';
+      const s = ((this.page-1)*this.pageSize)+1;
+      const e = Math.min(this.page*this.pageSize, this.totalCount);
+      return `Showing ${s.toLocaleString()}–${e.toLocaleString()} of ${this.totalCount.toLocaleString()}`;
+    },
+    get allSelected() { return this.events.length > 0 && this.selectedIds.length === this.events.length },
+    get hasActiveFilters() {
+      const f = this.filters;
+      return f.db || f.table || f.op || f.from || f.to || f.search;
+    },
+    get statCards() {
+      return [
+        { label:'Total',     value: this.stats.total    || 0, color:'text-white' },
+        { label:'INSERT',    value: this.stats.inserts  || 0, color:'text-emerald-400' },
+        { label:'UPDATE',    value: this.stats.updates  || 0, color:'text-blue-400' },
+        { label:'DELETE',    value: this.stats.deletes  || 0, color:'text-red-400' },
+        { label:'Tables',    value:(this.stats.tables   || []).length, color:'text-purple-400' },
+        { label:'Databases', value:(this.stats.databases|| []).length, color:'text-yellow-400' },
+      ]
+    },
+    get filteredTables() {
+      const ts = this.stats.tables || [];
+      if (!this.filters.db) return ts;
+      // Tables are returned as "schema.table" strings; no DB prefix → show all when DB filtered
+      return ts;
+    },
+
+    // ── Lifecycle ──────────────────────────────────────────────────────────
+    init() {
+      this.connect();
+    },
+
+    // ── Connection ─────────────────────────────────────────────────────────
+    async connect() {
+      this.connecting  = true;
+      this.connectError = '';
+      try {
+        const r = await fetch(`${this.agentUrl}/api/stats`, { signal: AbortSignal.timeout(4000) });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        this.stats     = await r.json();
+        this.connected = true;
+        localStorage.setItem('agentUrl', this.agentUrl);
+        await this.loadEvents();
+        this.startPolling();
+      } catch (e) {
+        this.connected    = false;
+        this.connectError = `Cannot reach agent at ${this.agentUrl}: ${e.message}`;
+      } finally {
+        this.connecting = false;
+      }
+    },
+
+    // ── Data loading ───────────────────────────────────────────────────────
+    async loadEvents() {
+      if (!this.connected) return;
+      this.loading = true;
+      try {
+        const p = new URLSearchParams({
+          page:   this.page,
+          limit:  this.pageSize,
+          sort:   this.sortCol,
+          dir:    this.sortDir,
+          db:     this.filters.db,
+          table:  this.filters.table,
+          op:     this.filters.op,
+          search: this.filters.search,
+          since:  this.filters.from  ? new Date(this.filters.from).toISOString()  : '',
+          until:  this.filters.to    ? new Date(this.filters.to).toISOString()    : '',
+        });
+        const r = await fetch(`${this.agentUrl}/api/logs?${p}`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const d     = await r.json();
+        this.events     = d.events || [];
+        this.totalCount = d.total  || 0;
+      } catch (e) {
+        console.error('loadEvents:', e);
+      } finally {
+        this.loading = false;
+      }
+    },
+
+    async loadStats() {
+      try {
+        const r = await fetch(`${this.agentUrl}/api/stats`);
+        if (r.ok) this.stats = await r.json();
+      } catch {}
+    },
+
+    // ── Polling ────────────────────────────────────────────────────────────
+    startPolling() {
+      this.polling = true;
+      this.lastTotal = this.totalCount;
+      this.pollingTimer = setInterval(async () => {
+        await this.loadStats();
+        const newTotal = this.stats.total || 0;
+        if (newTotal !== this.lastTotal) {
+          this.lastTotal = newTotal;
+          if (this.page === 1) await this.loadEvents();
+          else this.totalCount = newTotal;
+        }
+      }, 5000);
+    },
+
+    stopPolling() {
+      this.polling = false;
+      if (this.pollingTimer) clearInterval(this.pollingTimer);
+    },
+
+    // ── Sorting ────────────────────────────────────────────────────────────
+    sortBy(col) {
+      if (this.sortCol === col) {
+        this.sortDir = this.sortDir === 'desc' ? 'asc' : 'desc';
+      } else {
+        this.sortCol = col;
+        this.sortDir = 'desc';
+      }
+      this.page = 1;
+      this.loadEvents();
+    },
+
+    sortIcon(col) {
+      if (this.sortCol !== col) return '↕';
+      return this.sortDir === 'desc' ? '↓' : '↑';
+    },
+
+    // ── Filters ────────────────────────────────────────────────────────────
+    toggleOp(op) {
+      this.filters.op = this.filters.op === op ? '' : op;
+      this.resetAndLoad();
+    },
+
+    clearFilters() {
+      this.filters = { db:'', table:'', op:'', from:'', to:'', search:'' };
+      this.resetAndLoad();
+    },
+
+    resetAndLoad() {
+      this.page = 1;
+      this.selectedIds = [];
+      this.selectedEvs = {};
+      this.loadEvents();
+    },
+
+    // ── Pagination ─────────────────────────────────────────────────────────
+    prevPage() {
+      if (this.page > 1) { this.page--; this.loadEvents(); }
+    },
+    nextPage() {
+      if (this.page < this.totalPages) { this.page++; this.loadEvents(); }
+    },
+
+    // ── Selection ──────────────────────────────────────────────────────────
+    toggleSelect(ev) {
+      const idx = this.selectedIds.indexOf(ev.lsn);
+      if (idx >= 0) {
+        this.selectedIds.splice(idx, 1);
+        delete this.selectedEvs[ev.lsn];
+      } else {
+        this.selectedIds.push(ev.lsn);
+        this.selectedEvs[ev.lsn] = ev;
+      }
+    },
+
+    toggleSelectAll() {
+      if (this.allSelected) {
+        this.selectedIds = [];
+        this.selectedEvs = {};
+      } else {
+        this.events.forEach(ev => {
+          if (!this.selectedIds.includes(ev.lsn)) {
+            this.selectedIds.push(ev.lsn);
+            this.selectedEvs[ev.lsn] = ev;
+          }
+        });
+      }
+    },
+
+    // ── Modal ──────────────────────────────────────────────────────────────
+    showSQL(ev) {
+      this.modal = { show:true, title:`SQL — ${ev.operation} on ${ev.schema_name || ''}.${ev.table_name}`, sql: ev.sql_stmt || '-- No SQL available', isRollback:false, copied:false };
+    },
+
+    showRollback(ev) {
+      this.modal = { show:true, title:`Rollback — ${ev.operation} on ${ev.schema_name || ''}.${ev.table_name}`, sql: ev.rollback_sql || '-- No rollback SQL available', isRollback:true, copied:false };
+    },
+
+    copyModal() {
+      navigator.clipboard.writeText(this.modal.sql).then(() => {
+        this.modal.copied = true;
+        setTimeout(() => { this.modal.copied = false; }, 2000);
+      });
+    },
+
+    // ── Bulk rollback ──────────────────────────────────────────────────────
+    generateBulkRollback() {
+      const evs = Object.values(this.selectedEvs)
+        .filter(ev => ev.rollback_sql && !ev.rollback_sql.startsWith('--'))
+        .sort((a, b) => (b.lsn > a.lsn ? 1 : -1)); // reverse LSN order
+
+      const lines = [
+        '-- ============================================================',
+        `-- Bulk Rollback Script · rollback4sqlserver by dbaops`,
+        `-- Generated: ${new Date().toISOString()}`,
+        `-- Events: ${evs.length} (reverse LSN order)`,
+        '-- ============================================================',
+        '-- ⚠  REVIEW CAREFULLY BEFORE EXECUTING.',
+        '-- ⚠  TEST ON A NON-PRODUCTION ENVIRONMENT FIRST.',
+        '-- ============================================================',
+        '',
+        'BEGIN TRANSACTION;',
+        '',
+      ];
+
+      evs.forEach((ev, i) => {
+        lines.push(`-- [${i+1}] LSN: ${ev.lsn}  TXN: ${ev.txn_id}  OP: ${ev.operation}  TABLE: ${ev.schema_name || ''}.${ev.table_name}`);
+        lines.push(ev.rollback_sql.trim());
+        lines.push('');
+      });
+
+      lines.push('-- COMMIT TRANSACTION;  ← Uncomment after review');
+      lines.push('-- ROLLBACK TRANSACTION; ← Or rollback if unsure');
+
+      this.bulkScript    = lines.join('\n');
+      this.showBulkModal = true;
+      this.bulkCopied    = false;
+    },
+
+    copyBulk() {
+      navigator.clipboard.writeText(this.bulkScript).then(() => {
+        this.bulkCopied = true;
+        setTimeout(() => { this.bulkCopied = false; }, 2000);
+      });
+    },
+
+    // ── Helpers ────────────────────────────────────────────────────────────
+    truncSQL(sql) {
+      if (!sql) return '';
+      const s = sql.replace(/\s+/g, ' ').trim();
+      return s.length > 80 ? s.slice(0, 80) + '…' : s;
+    },
+
+    formatTime(ts) {
+      if (!ts) return '—';
+      const d = new Date(ts);
+      const now = Date.now();
+      const diff = (now - d.getTime()) / 1000;
+      if (diff < 60)   return `${Math.floor(diff)}s ago`;
+      if (diff < 3600) return `${Math.floor(diff/60)}m ago`;
+      if (diff < 86400) return `${Math.floor(diff/3600)}h ago`;
+      return d.toLocaleDateString(undefined, { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' });
+    },
+  }
+}
+</script>
+</body>
+</html>

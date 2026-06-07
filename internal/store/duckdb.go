@@ -2,8 +2,11 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -13,7 +16,52 @@ import (
 	"github.com/uns/mssqllogrecovery/internal/dml"
 )
 
-const duckBatchSize = 500
+const (
+	duckBatchSize = 500
+	ttlDays       = 30
+)
+
+// calcDuckDBMaxMemory computes the DuckDB memory limit:
+//   - Total system RAM / 100
+//   - Hard cap at 2 GB
+//   - Minimum 64 MB (safeguard on low-RAM machines)
+func calcDuckDBMaxMemory() string {
+	total := totalSystemMemoryBytes()
+	if total == 0 {
+		return "128MB"
+	}
+	limit := total / 100
+	const (
+		maxCap = uint64(2 * 1024 * 1024 * 1024) // 2 GB
+		minMB  = uint64(64)
+	)
+	if limit > maxCap {
+		limit = maxCap
+	}
+	mb := limit / (1024 * 1024)
+	if mb < minMB {
+		mb = minMB
+	}
+	return fmt.Sprintf("%dMB", mb)
+}
+
+// dbFilePath returns the DuckDB file path from AGENT_DB_PATH env var,
+// defaulting to "./data/agent_metrics.db" relative to the binary.
+func dbFilePath() string {
+	if p := os.Getenv("AGENT_DB_PATH"); p != "" {
+		return p
+	}
+	return "" // empty = in-memory (default for serve mode)
+}
+
+// PersistentDBPath returns the configured file path for persistent mode.
+// Returns "" when in-memory mode is desired.
+func PersistentDBPath() string {
+	if p := os.Getenv("AGENT_DB_PATH"); p != "" {
+		return p
+	}
+	return ""
+}
 
 // DuckDBStore persists DML statements to an embedded DuckDB database.
 type DuckDBStore struct {
@@ -27,7 +75,8 @@ type DuckDBStore struct {
 // OpenDuckDB opens an embedded DuckDB database.
 // Pass "" or ":memory:" for an in-memory database — a shared Connector is used so
 // all pool connections see the same data (MVCC: readers never block on the write batch).
-// Pass a file path for a persistent database.
+// Pass a file path for a persistent database (auto-creates parent directories).
+// Memory limit is set dynamically via calcDuckDBMaxMemory().
 func OpenDuckDB(path string) (*DuckDBStore, error) {
 	var db *sql.DB
 
@@ -38,6 +87,10 @@ func OpenDuckDB(path string) (*DuckDBStore, error) {
 		}
 		db = sql.OpenDB(connector)
 	} else {
+		// Auto-create parent directory.
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return nil, fmt.Errorf("duckdb mkdirall: %w", err)
+		}
 		var err error
 		db, err = sql.Open("duckdb", path)
 		if err != nil {
@@ -47,6 +100,15 @@ func OpenDuckDB(path string) (*DuckDBStore, error) {
 
 	// DuckDB MVCC lets readers run concurrently with the open write batch transaction.
 	db.SetMaxOpenConns(4)
+
+	// Apply dynamic memory limit: Total RAM / 100, capped at 2 GB.
+	maxMem := calcDuckDBMaxMemory()
+	if _, err := db.Exec(fmt.Sprintf("PRAGMA max_memory='%s'", maxMem)); err != nil {
+		// Non-fatal: log and continue.
+		fmt.Fprintf(os.Stderr, "warn: duckdb set max_memory=%s: %v\n", maxMem, err)
+	}
+	// Use a single thread to reduce per-row contention with the batch writer.
+	db.Exec("PRAGMA threads=2")
 
 	s := &DuckDBStore{db: db}
 	if err := s.setupSchema(); err != nil {
@@ -58,6 +120,44 @@ func OpenDuckDB(path string) (*DuckDBStore, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// StartTTLWorker starts a background goroutine that deletes log_events older than
+// 30 days every hour and checkpoints the WAL to reclaim disk space.
+// Call this only for file-based (persistent) DuckDB instances.
+func (s *DuckDBStore) StartTTLWorker(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.runTTLCleanup()
+			}
+		}
+	}()
+}
+
+func (s *DuckDBStore) runTTLCleanup() {
+	// Flush pending writes before cleanup so we delete from a committed state.
+	if err := s.Flush(); err != nil {
+		fmt.Fprintf(os.Stderr, "warn: ttl flush: %v\n", err)
+		return
+	}
+	cutoff := fmt.Sprintf("NOW() - INTERVAL '%d DAYS'", ttlDays)
+	res, err := s.db.Exec(fmt.Sprintf(
+		"DELETE FROM log_events WHERE event_time IS NOT NULL AND event_time < %s", cutoff,
+	))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warn: ttl delete: %v\n", err)
+		return
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		fmt.Fprintf(os.Stderr, "info: ttl removed %d events older than %d days\n", n, ttlDays)
+		s.db.Exec("PRAGMA checkpoint")
+	}
 }
 
 func (s *DuckDBStore) setupSchema() error {

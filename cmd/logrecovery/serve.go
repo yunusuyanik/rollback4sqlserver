@@ -3,10 +3,8 @@ package main
 import (
 	"context"
 	"database/sql"
-	"embed"
 	"encoding/json"
 	"fmt"
-	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
@@ -27,9 +25,6 @@ import (
 	"github.com/uns/mssqllogrecovery/internal/schema"
 	"github.com/uns/mssqllogrecovery/internal/store"
 )
-
-//go:embed web
-var webFS embed.FS
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -116,10 +111,15 @@ by the browser from https://rollback4sqlserver.dbaops.io.`,
 func runServe(httpPort int, host, user, pass string, sqlPort int, dbName string, allDBs bool, sinceTime time.Time) error {
 	bgCtx, bgCancel = context.WithCancel(context.Background())
 
+	dbPath := store.PersistentDBPath() // "" = in-memory, else persistent file
 	var err error
-	appStore, err = store.OpenDuckDB("")
+	appStore, err = store.OpenDuckDB(dbPath)
 	if err != nil {
 		return fmt.Errorf("init store: %w", err)
+	}
+	if dbPath != "" {
+		// Persistent mode: start background TTL worker to enforce 30-day retention.
+		appStore.StartTTLWorker(bgCtx)
 	}
 
 	if host != "" {
@@ -462,6 +462,8 @@ func corsMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("Vary", "Origin")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		// Chrome Private Network Access: allow HTTPS public pages → localhost requests.
+		w.Header().Set("Access-Control-Allow-Private-Network", "true")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -474,8 +476,15 @@ func corsMiddleware(next http.Handler) http.Handler {
 
 func buildMux() http.Handler {
 	mux := http.NewServeMux()
-	sub, _ := fs.Sub(webFS, "web")
-	mux.Handle("/", http.FileServer(http.FS(sub)))
+	// No embedded web UI — frontend is served via Cloudflare Pages.
+	// Root returns a plain JSON health check for diagnostics.
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, map[string]string{"status": "ok", "agent": "rollback4sqlserver"})
+	})
 
 	// Connection / interactive scan (for web UI usage without CLI flags)
 	mux.HandleFunc("/api/connect", handleConnect)
@@ -691,15 +700,16 @@ func handleLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	off := (page - 1) * limit
 
-	where, args := buildWhere("", q.Get("db"), "", "", "", q.Get("since"), q.Get("until"))
+	where, args := buildWhere(q.Get("op"), q.Get("db"), q.Get("schema"), q.Get("table"), q.Get("search"), q.Get("since"), q.Get("until"))
 	conn := s.DB()
 
 	var total int
 	conn.QueryRow("SELECT count(*) FROM log_events"+where, args...).Scan(&total)
 
+	orderBy := buildOrderBy(q.Get("sort"), q.Get("dir"))
 	rows, err := conn.Query(
 		"SELECT lsn, txn_id, operation, db_name, schema_name, table_name, sql_stmt, rollback_sql, event_time FROM log_events"+
-			where+fmt.Sprintf(" ORDER BY event_time DESC NULLS LAST, id DESC LIMIT %d OFFSET %d", limit, off),
+			where+orderBy+fmt.Sprintf(" LIMIT %d OFFSET %d", limit, off),
 		args...)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
@@ -1167,6 +1177,28 @@ func buildWhere(op, db, sch, tbl, search, since, until string) (string, []interf
 		return "", nil
 	}
 	return " WHERE " + strings.Join(conds, " AND "), args
+}
+
+// buildOrderBy returns a safe ORDER BY clause.
+// Allowed sort columns are whitelisted to prevent SQL injection.
+func buildOrderBy(col, dir string) string {
+	allowed := map[string]string{
+		"event_time": "event_time",
+		"lsn":        "lsn",
+		"operation":  "operation",
+		"db_name":    "db_name",
+		"table_name": "table_name",
+	}
+	c, ok := allowed[col]
+	if !ok {
+		c = "event_time"
+	}
+	d := "DESC"
+	if strings.ToLower(dir) == "asc" {
+		d = "ASC"
+	}
+	// Secondary sort by id ensures stable ordering within ties.
+	return fmt.Sprintf(" ORDER BY %s %s NULLS LAST, id %s", c, d, d)
 }
 
 // ── Connection helpers ────────────────────────────────────────────────────────
