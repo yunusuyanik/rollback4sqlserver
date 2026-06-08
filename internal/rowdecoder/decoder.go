@@ -16,6 +16,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"math/big"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -295,22 +296,43 @@ func decodeTime(b []byte, scale int) time.Time {
 	return time.Date(0, 1, 1, int(h), int(m), int(s), int(ns), time.UTC)
 }
 
-// decodeDecimal decodes a SQL Server decimal/numeric stored value.
-// Layout: sign byte (1=positive) + LE unsigned integer bytes.
-func decodeDecimal(b []byte, scale int) float64 {
+// decodeDecimal decodes a SQL Server decimal/numeric stored value into an
+// exact decimal string. No float64 is used; precision up to DECIMAL(38) is
+// fully supported.
+//
+// Layout: b[0] = sign (1=positive, 0=negative), b[1:] = little-endian
+// unsigned integer magnitude. Total length from decimalSize(): 5/9/13/17.
+func decodeDecimal(b []byte, scale int) string {
 	if len(b) < 2 {
-		return 0
+		return "0"
 	}
 	positive := b[0] == 1
-	var mag uint64
-	for i := 1; i < len(b) && i <= 8; i++ {
-		mag |= uint64(b[i]) << (8 * (i - 1))
+
+	// Reverse LE bytes to BE for big.Int.SetBytes.
+	valueBytes := b[1:]
+	rev := make([]byte, len(valueBytes))
+	for i, byt := range valueBytes {
+		rev[len(valueBytes)-1-i] = byt
 	}
-	v := float64(mag) / math.Pow10(scale)
-	if !positive {
-		v = -v
+	mag := new(big.Int).SetBytes(rev)
+
+	s := mag.String() // unscaled decimal digits
+
+	var result string
+	if scale == 0 {
+		result = s
+	} else {
+		// Pad with leading zeros so there are at least scale+1 digits.
+		for len(s) <= scale {
+			s = "0" + s
+		}
+		result = s[:len(s)-scale] + "." + s[len(s)-scale:]
 	}
-	return v
+
+	if !positive && mag.Sign() != 0 {
+		result = "-" + result
+	}
+	return result
 }
 
 // --- Variable-length decoders ---

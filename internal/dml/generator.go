@@ -275,6 +275,9 @@ func formatValue(v *rowdecoder.Value, typeID int) string {
 		switch typeID {
 		case schema.TypeNvarchar, schema.TypeNchar, schema.TypeNtext:
 			return "N'" + escapeSQ(val) + "'"
+		case schema.TypeNumeric, schema.TypeDecimal:
+			// Exact decimal string from decodeDecimal — no quotes, no float conversion.
+			return val
 		default:
 			return "'" + escapeSQ(val) + "'"
 		}
