@@ -39,6 +39,15 @@ WHERE i.is_primary_key = 1
 ORDER BY ic.object_id, ic.key_ordinal
 `
 
+// compressionQuery reads the highest data_compression value for each table's
+// base partition (heap = index_id 0, clustered index = index_id 1).
+const compressionQuery = `
+SELECT p.object_id, MAX(p.data_compression)
+FROM sys.partitions p
+WHERE p.index_id IN (0, 1)
+GROUP BY p.object_id
+`
+
 // Extract reads table/column metadata from the SQL Server and returns a Schema.
 // The connection should be read-only; only SELECT statements are executed.
 func Extract(db *sql.DB) (*Schema, error) {
@@ -109,6 +118,20 @@ func Extract(db *sql.DB) (*Schema, error) {
 			}
 		}
 		pkRows.Close()
+	}
+
+	// Data compression — best-effort; ignore errors (older permissions or SQL Server versions).
+	comprRows, err := db.QueryContext(ctx, compressionQuery)
+	if err == nil {
+		for comprRows.Next() {
+			var oid, dc int
+			if err := comprRows.Scan(&oid, &dc); err == nil {
+				if t, ok := sch.Tables[oid]; ok {
+					t.DataCompression = dc
+				}
+			}
+		}
+		comprRows.Close()
 	}
 
 	for _, t := range sch.Tables {

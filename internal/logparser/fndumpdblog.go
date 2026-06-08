@@ -90,7 +90,7 @@ func buildDumpQuery(startLSN, endLSN string, files []string, ops []string) strin
 	sb.WriteString("SELECT [Current LSN],[Operation],[Context],[Transaction ID],")
 	sb.WriteString("[AllocUnitName],[Begin time],[End time],")
 	sb.WriteString("[RowLog Contents 0],[RowLog Contents 1],[RowLog Contents 2],")
-	sb.WriteString("[RowLog Contents 3],[RowLog Contents 4]")
+	sb.WriteString("[RowLog Contents 3],[RowLog Contents 4],[Log Record]")
 	sb.WriteString(" FROM fn_dump_dblog(")
 
 	// param 1: start LSN
@@ -207,5 +207,6 @@ func scanRecord(rows *sql.Rows, colNames []string, idx map[string]int) (*LogReco
 		Contents2:     blob("RowLog Contents 2"),
 		Contents3:     blob("RowLog Contents 3"),
 		Contents4:     blob("RowLog Contents 4"),
+		RawLogRecord:  blob("Log Record"),
 	}, nil
 }

@@ -18,7 +18,6 @@ import (
 	"time"
 
 	_ "github.com/microsoft/go-mssqldb"
-	"github.com/spf13/cobra"
 
 	"github.com/uns/mssqllogrecovery/internal/dml"
 	"github.com/uns/mssqllogrecovery/internal/logparser"
@@ -60,66 +59,89 @@ var (
 	checkpointMu  sync.RWMutex
 	ldfCheckpoint = map[string]string{}
 
+	// pollState persists pending transaction state across poll cycles so that
+	// transactions whose INSERT/UPDATE/DELETE records arrive in one cycle but
+	// whose COMMIT arrives in the next cycle are not silently dropped.
+	pollStateMu   sync.Mutex
+	pollStateByDB = map[string]*dbPollState{}
+
 	// Context controlling all auto-scan / poller goroutines.
 	bgCtx    context.Context
 	bgCancel context.CancelFunc
 )
 
-// ── serve command ─────────────────────────────────────────────────────────────
+// ── Console logger ────────────────────────────────────────────────────────────
 
-func serveCmd() *cobra.Command {
-	var (
-		httpPort int
-		host     string
-		user     string
-		pass     string
-		sqlPort  int
-		dbName   string
-		allDBs   bool
-		since    string
-	)
-	cmd := &cobra.Command{
-		Use:   "serve",
-		Short: "Start the local agent (REST API + web UI)",
-		Long: `Starts the privacy-first local log-recovery agent.
+// logf prints a timestamped line to stdout: [15:04:05] message
+func logf(format string, args ...interface{}) {
+	ts := time.Now().Format("15:04:05")
+	fmt.Printf("[%s] %s\n", ts, fmt.Sprintf(format, args...))
+}
 
-If --host (plus --db or --all-dbs) is given, the agent auto-connects on
-startup, loads history bounded by --since, then continuously polls the live
-transaction log every 5 s — no manual interaction required.
-
-The REST API at http://localhost:<port>/api/ is designed to be called directly
-by the browser from https://rollback4sqlserver.dbaops.io.`,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			sinceTime, err := parseSince(since)
-			if err != nil {
-				return err
-			}
-			return runServe(httpPort, host, user, pass, sqlPort, dbName, allDBs, sinceTime)
-		},
+// fmtN formats an integer with comma separators (1247 → "1,247").
+func fmtN(n int64) string {
+	s := fmt.Sprintf("%d", n)
+	neg := n < 0
+	if neg {
+		s = s[1:]
 	}
-	cmd.Flags().IntVar(&httpPort, "port", 8182, "HTTP port for the local agent")
-	cmd.Flags().StringVar(&host, "host", "", "SQL Server host (triggers auto-scan)")
-	cmd.Flags().StringVar(&user, "user", "", "SQL Server login (blank = Windows auth)")
-	cmd.Flags().StringVar(&pass, "pass", "", "SQL Server password")
-	cmd.Flags().IntVar(&sqlPort, "sql-port", 1433, "SQL Server TCP port")
-	cmd.Flags().StringVar(&dbName, "db", "", "Database to scan")
-	cmd.Flags().BoolVar(&allDBs, "all-dbs", false, "Scan all online user databases automatically")
-	cmd.Flags().StringVar(&since, "since", "24h", "History depth: 24h | 7d | 30d | all")
-	return cmd
+	out := make([]byte, 0, len(s)+(len(s)-1)/3)
+	for i, c := range s {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			out = append(out, ',')
+		}
+		out = append(out, byte(c))
+	}
+	if neg {
+		return "-" + string(out)
+	}
+	return string(out)
+}
+
+// shortLSN trims a full LSN "00000022:000001A1:0001" to "22:1A1" for compact display.
+func shortLSN(lsn string) string {
+	if lsn == "" {
+		return "?"
+	}
+	parts := strings.SplitN(lsn, ":", 3)
+	if len(parts) < 2 {
+		return lsn
+	}
+	a := strings.TrimLeft(parts[0], "0")
+	if a == "" {
+		a = "0"
+	}
+	b := strings.TrimLeft(parts[1], "0")
+	if b == "" {
+		b = "0"
+	}
+	return a + ":" + b
 }
 
 func runServe(httpPort int, host, user, pass string, sqlPort int, dbName string, allDBs bool, sinceTime time.Time) error {
 	bgCtx, bgCancel = context.WithCancel(context.Background())
 
-	dbPath := store.PersistentDBPath() // "" = in-memory, else persistent file
+	dbPath := store.PersistentDBPath()
 	var err error
 	appStore, err = store.OpenDuckDB(dbPath)
 	if err != nil {
 		return fmt.Errorf("init store: %w", err)
 	}
 	if dbPath != "" {
-		// Persistent mode: start background TTL worker to enforce 30-day retention.
+		logf("persistent store: %s", dbPath)
 		appStore.StartTTLWorker(bgCtx)
+		if cps, err2 := appStore.LoadAllCheckpoints(); err2 == nil {
+			checkpointMu.Lock()
+			for db, lsn := range cps {
+				ldfCheckpoint[db] = lsn
+			}
+			checkpointMu.Unlock()
+			if len(cps) > 0 {
+				logf("restored %d checkpoint(s) — incremental scan will resume", len(cps))
+			}
+		}
+	} else {
+		logf("store: in-memory (set AGENT_DB_PATH for persistence)")
 	}
 
 	if host != "" {
@@ -132,25 +154,72 @@ func runServe(httpPort int, host, user, pass string, sqlPort int, dbName string,
 
 		if dbName != "" || allDBs {
 			go runAutoScan(server, user, pass, dbName, allDBs, sinceTime)
+		} else {
+			logf("no --db or --all-dbs specified — connect via UI or add flag")
 		}
+	} else {
+		logf("no --host specified — waiting for browser connection")
 	}
 
 	addr := fmt.Sprintf(":%d", httpPort)
-	fmt.Printf("\n  MSSQL Log Recovery — Local Agent\n")
-	fmt.Printf("  API  : http://localhost%s/api/\n", addr)
-	fmt.Printf("  UI   : https://rollback4sqlserver.dbaops.io  → connect to http://localhost%s\n\n", addr)
+	logf("API ready → http://localhost%s", addr)
+	logf("open https://rollback4sqlserver.dbaops.io and connect to http://localhost%s", addr)
 	return http.ListenAndServe(addr, buildMux())
+}
+
+// ── Poll state ───────────────────────────────────────────────────────────────
+
+// dbPollState persists transaction-level bookkeeping for one database's LDF
+// poller across poll cycles. A transaction whose data records arrive in cycle N
+// and whose COMMIT arrives in cycle N+1 is correctly flushed thanks to this state.
+type dbPollState struct {
+	pending    map[string][]*dml.Statement
+	beginTimes map[string]time.Time
+}
+
+func getPollState(dbName string) *dbPollState {
+	pollStateMu.Lock()
+	defer pollStateMu.Unlock()
+	if s, ok := pollStateByDB[dbName]; ok {
+		return s
+	}
+	s := &dbPollState{
+		pending:    make(map[string][]*dml.Statement),
+		beginTimes: make(map[string]time.Time),
+	}
+	pollStateByDB[dbName] = s
+	return s
+}
+
+// pruneStalePollState discards pending entries for transactions that started
+// more than 2 hours ago and never committed (avoids unbounded growth).
+func pruneStalePollState(state *dbPollState) {
+	cutoff := time.Now().Add(-2 * time.Hour)
+	for txnID, bt := range state.beginTimes {
+		if !bt.IsZero() && bt.Before(cutoff) {
+			delete(state.pending, txnID)
+			delete(state.beginTimes, txnID)
+		}
+	}
 }
 
 // ── Auto-scan orchestration ───────────────────────────────────────────────────
 
 func runAutoScan(server, user, pass, dbName string, allDBs bool, sinceTime time.Time) {
-	setProgress(func(p *ScanProgress) { p.Running = true; p.Message = "Resolving target databases…" })
+	setProgress(func(p *ScanProgress) { p.Running = true; p.Message = "Connecting…" })
 
+	logf("connecting to SQL Server at %s", server)
 	dbs, err := resolveTargetDBs(server, user, pass, dbName, allDBs)
 	if err != nil {
+		logf("ERROR: %v", err)
 		setProgress(func(p *ScanProgress) { p.Running = false; p.Done = true; p.ErrMsg = err.Error() })
 		return
+	}
+	logf("connected. target database(s): %s", strings.Join(dbs, ", "))
+	if !sinceTime.IsZero() {
+		logf("scanning changes since %s", sinceTime.Format("2006-01-02 15:04:05"))
+	} else {
+		logf("scanning full available log history")
 	}
 
 	for _, db := range dbs {
@@ -161,6 +230,7 @@ func runAutoScan(server, user, pass, dbName string, allDBs bool, sinceTime time.
 		}
 		setProgress(func(p *ScanProgress) { p.Message = fmt.Sprintf("Initial scan: %s…", db) })
 		if err := scanDatabase(bgCtx, server, user, pass, db, sinceTime); err != nil && err != context.Canceled {
+			logf("ERROR [%s]: %v", db, err)
 			setProgress(func(p *ScanProgress) { p.ErrMsg = fmt.Sprintf("%s: %v", db, err) })
 		}
 	}
@@ -169,11 +239,18 @@ func runAutoScan(server, user, pass, dbName string, allDBs bool, sinceTime time.
 	st := appStore
 	appMu.RUnlock()
 	if err := st.Flush(); err != nil {
+		logf("ERROR flush: %v", err)
 		setProgress(func(p *ScanProgress) { p.ErrMsg = "flush: " + err.Error() })
 	}
 
+	progMu.RLock()
+	total := progress.Total
+	progMu.RUnlock()
+	logf("initial scan complete: %s events imported", fmtN(total))
+	logf("polling live log every 5s for %d database(s)", len(dbs))
+
 	setProgress(func(p *ScanProgress) {
-		p.Message = fmt.Sprintf("Polling live log every 5 s for %d database(s) — %d events loaded", len(dbs), p.Total)
+		p.Message = fmt.Sprintf("Polling live log every 5s — %s events loaded", fmtN(p.Total))
 	})
 
 	for _, db := range dbs {
@@ -213,6 +290,9 @@ func resolveTargetDBs(server, user, password, dbName string, allDBs bool) ([]str
 }
 
 // scanDatabase does a one-time committed-only LDF scan bounded by sinceTime.
+// On restart it resumes from the persisted LSN checkpoint, skipping events
+// already stored in the DB. The UNIQUE(db_name, lsn) constraint provides a
+// second line of defence in case of overlap.
 func scanDatabase(ctx context.Context, server, user, pass, dbName string, sinceTime time.Time) error {
 	srcDB, err := openConnection(server, user, pass, dbName)
 	if err != nil {
@@ -224,6 +304,7 @@ func scanDatabase(ctx context.Context, server, user, pass, dbName string, sinceT
 	if err != nil {
 		return fmt.Errorf("schema: %w", err)
 	}
+	logf("[%s] schema: %d tables", dbName, len(sch.Tables))
 	appMu.Lock()
 	appSchemas[dbName] = sch
 	appMu.Unlock()
@@ -232,10 +313,35 @@ func scanDatabase(ctx context.Context, server, user, pass, dbName string, sinceT
 	st := appStore
 	appMu.RUnlock()
 
+	// If a checkpoint exists (loaded from DB at startup), resume from that LSN.
+	// This prevents re-reading the full sinceTime window on restart.
+	checkpointMu.RLock()
+	resumeLSN := ldfCheckpoint[dbName]
+	checkpointMu.RUnlock()
+
+	// When resuming, the LSN bound is more precise than sinceTime — disable the
+	// time filter so in-flight transactions at the boundary are not silently dropped.
+	effectiveSince := sinceTime
+	if resumeLSN != "" {
+		effectiveSince = time.Time{}
+	}
+
+	if resumeLSN != "" {
+		logf("[%s] resuming from LSN %s", dbName, resumeLSN)
+	} else {
+		logf("[%s] starting initial scan", dbName)
+	}
+
 	gen := dml.New(sch)
 	pending := make(map[string][]*dml.Statement)
 	beginTimes := make(map[string]time.Time)
-	var maxLSN string
+	var firstLSN, maxLSN string
+
+	progMu.RLock()
+	snapIns, snapUpd, snapDel, snapTotal := progress.Inserts, progress.Updates, progress.Deletes, progress.Total
+	progMu.RUnlock()
+
+	var lastLog time.Time
 
 	ops := scanOps()
 	handler := func(rec *logparser.LogRecord) error {
@@ -244,20 +350,52 @@ func scanDatabase(ctx context.Context, server, user, pass, dbName string, sinceT
 			return context.Canceled
 		default:
 		}
+		if firstLSN == "" {
+			firstLSN = rec.LSN
+		}
 		if rec.LSN > maxLSN {
 			maxLSN = rec.LSN
 		}
-		return handleScanRecord(rec, gen, dbName, sinceTime, st, pending, beginTimes, true, func(string) bool { return true })
+		err := handleScanRecord(rec, gen, dbName, effectiveSince, st, pending, beginTimes, true, func(string) bool { return true })
+		if time.Since(lastLog) >= time.Second {
+			progMu.RLock()
+			tot := progress.Total
+			errs := progress.Errors
+			progMu.RUnlock()
+			if tot > snapTotal {
+				logf("[%s] imported %s events · %d errors", dbName, fmtN(tot), errs)
+				lastLog = time.Now()
+			}
+		}
+		return err
 	}
 
-	if err := logparser.NewLDFReader(srcDB).Read(ops, handler); err != nil && err != context.Canceled {
+	r := logparser.NewLDFReader(srcDB)
+	if resumeLSN != "" {
+		r = r.WithLSNRange(resumeLSN, "")
+	}
+	if err := r.Read(ops, handler); err != nil && err != context.Canceled {
 		return err
 	}
 	if maxLSN != "" {
 		checkpointMu.Lock()
 		ldfCheckpoint[dbName] = maxLSN
 		checkpointMu.Unlock()
+		if st != nil {
+			st.SaveCheckpoint(dbName, maxLSN)
+		}
 	}
+
+	progMu.RLock()
+	deltaTotal := progress.Total - snapTotal
+	deltaIns := progress.Inserts - snapIns
+	deltaUpd := progress.Updates - snapUpd
+	deltaDel := progress.Deletes - snapDel
+	deltaErrs := progress.Errors
+	progMu.RUnlock()
+	logf("[%s] imported %s (ins:%s upd:%s del:%s) · %d errors · LSN %s→%s",
+		dbName, fmtN(deltaTotal), fmtN(deltaIns), fmtN(deltaUpd), fmtN(deltaDel),
+		deltaErrs, shortLSN(firstLSN), shortLSN(maxLSN))
 	return nil
 }
 
@@ -270,14 +408,46 @@ func startLDFPoller(ctx context.Context, server, user, pass, dbName string) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			checkpointMu.RLock()
+			lsnBefore := ldfCheckpoint[dbName]
+			checkpointMu.RUnlock()
+
+			progMu.RLock()
+			snapTotal := progress.Total
+			snapIns := progress.Inserts
+			snapUpd := progress.Updates
+			snapDel := progress.Deletes
+			snapErrs := progress.Errors
+			progMu.RUnlock()
+
 			if err := pollLDF(ctx, server, user, pass, dbName); err != nil && err != context.Canceled {
+				logf("[%s] poll ERROR: %v", dbName, err)
 				setProgress(func(p *ScanProgress) { p.ErrMsg = fmt.Sprintf("poll %s: %v", dbName, err) })
 			}
+
 			appMu.RLock()
 			st := appStore
 			appMu.RUnlock()
 			if st != nil {
 				st.Flush()
+			}
+
+			checkpointMu.RLock()
+			lsnAfter := ldfCheckpoint[dbName]
+			checkpointMu.RUnlock()
+
+			progMu.RLock()
+			delta := progress.Total - snapTotal
+			deltaIns := progress.Inserts - snapIns
+			deltaUpd := progress.Updates - snapUpd
+			deltaDel := progress.Deletes - snapDel
+			errDelta := progress.Errors - snapErrs
+			progMu.RUnlock()
+
+			if delta > 0 {
+				logf("[%s] +%s imported (ins:%s upd:%s del:%s) · %d errors · LSN %s→%s",
+					dbName, fmtN(delta), fmtN(deltaIns), fmtN(deltaUpd), fmtN(deltaDel),
+					errDelta, shortLSN(lsnBefore), shortLSN(lsnAfter))
 			}
 		}
 	}
@@ -303,8 +473,12 @@ func pollLDF(ctx context.Context, server, user, pass, dbName string) error {
 	checkpointMu.RUnlock()
 
 	gen := dml.New(sch)
-	pending := make(map[string][]*dml.Statement)
-	beginTimes := make(map[string]time.Time)
+
+	// Use persistent state so transactions whose data records arrive in this
+	// cycle but whose COMMIT arrives in the next cycle are not lost.
+	state := getPollState(dbName)
+	pruneStalePollState(state)
+
 	var maxLSN string
 
 	handler := func(rec *logparser.LogRecord) error {
@@ -314,12 +488,16 @@ func pollLDF(ctx context.Context, server, user, pass, dbName string) error {
 		default:
 		}
 		if rec.LSN == startLSN {
-			return nil // skip boundary record (already stored)
+			// Skip the boundary record: it was the last record of the previous
+			// poll cycle and is already stored. Data records for in-flight
+			// transactions at the boundary are preserved in state.pending from
+			// the previous cycle — they will be flushed when their COMMIT arrives.
+			return nil
 		}
 		if rec.LSN > maxLSN {
 			maxLSN = rec.LSN
 		}
-		return handleScanRecord(rec, gen, dbName, time.Time{}, st, pending, beginTimes, true, func(string) bool { return true })
+		return handleScanRecord(rec, gen, dbName, time.Time{}, st, state.pending, state.beginTimes, true, func(string) bool { return true })
 	}
 
 	r := logparser.NewLDFReader(srcDB)
@@ -333,6 +511,9 @@ func pollLDF(ctx context.Context, server, user, pass, dbName string) error {
 		checkpointMu.Lock()
 		ldfCheckpoint[dbName] = maxLSN
 		checkpointMu.Unlock()
+		if st != nil {
+			st.SaveCheckpoint(dbName, maxLSN)
+		}
 	}
 	return nil
 }
@@ -409,6 +590,9 @@ func parseSince(s string) (time.Time, error) {
 	s = strings.TrimSpace(strings.ToLower(s))
 	if s == "" || s == "all" {
 		return time.Time{}, nil
+	}
+	if s == "now" {
+		return time.Now(), nil
 	}
 	if strings.HasSuffix(s, "d") {
 		days, err := strconv.Atoi(strings.TrimSuffix(s, "d"))

@@ -2,6 +2,7 @@
 package dml
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -21,6 +22,11 @@ type Statement struct {
 	RollbackSQL   string    // inverse SQL — undoes what happened
 	Timestamp     time.Time // transaction begin time from LOP_BEGIN_XACT
 	Database      string    // SQL Server database name
+
+	// SkipReason is non-empty when SQL generation was intentionally suppressed.
+	// SQL and RollbackSQL are comment strings (not executable) when this is set.
+	// Values: "COMPRESSED_ROW_NOT_SUPPORTED", "COMPRESSED_PAGE_NOT_SUPPORTED".
+	SkipReason string `json:"skip_reason,omitempty"`
 }
 
 // Generator converts log records into DML statements.
@@ -51,6 +57,15 @@ func (g *Generator) Generate(rec *logparser.LogRecord) (*Statement, error) {
 
 	tableName := fmt.Sprintf("[%s].[%s]", t.Schema, t.Name)
 
+	// Block SQL generation for compressed tables. The uncompressed row decoder
+	// cannot interpret ROW or PAGE compressed row images and would produce wrong SQL.
+	switch t.DataCompression {
+	case schema.CompressionRow:
+		return compressionSkip(rec, tableName, "COMPRESSED_ROW_NOT_SUPPORTED"), nil
+	case schema.CompressionPage:
+		return compressionSkip(rec, tableName, "COMPRESSED_PAGE_NOT_SUPPORTED"), nil
+	}
+
 	switch rec.Operation {
 	case logparser.OpInsertRows:
 		return g.insert(rec, t, tableName)
@@ -75,9 +90,66 @@ func (g *Generator) Generate(rec *logparser.LogRecord) (*Statement, error) {
 	return nil, nil
 }
 
+// compressionSkip builds a Statement with SQL set to a comment and SkipReason set.
+// SQL and RollbackSQL are not executable; callers must check SkipReason before executing.
+func compressionSkip(rec *logparser.LogRecord, tableName, reason string) *Statement {
+	msg := fmt.Sprintf("-- %s: %s — re-run 'logrecovery schema' if compression was recently changed", reason, tableName)
+	return &Statement{
+		LSN:           rec.LSN,
+		TransactionID: rec.TransactionID,
+		Operation:     rec.Operation,
+		Table:         tableName,
+		SQL:           msg,
+		RollbackSQL:   msg,
+		SkipReason:    reason,
+	}
+}
+
+// schemaMismatchSkip builds a Statement with SQL set to a comment and SkipReason = SCHEMA_MISMATCH.
+// Emitted when the row's column count or column_id layout is inconsistent with the current schema,
+// meaning the schema was changed (DROP COLUMN, or DROP+ADD) after this row was written.
+// Re-running 'logrecovery schema' and re-scanning will resolve this once all rows are post-schema-change.
+func schemaMismatchSkip(rec *logparser.LogRecord, tableName string) *Statement {
+	msg := fmt.Sprintf("-- SCHEMA_MISMATCH: %s row layout does not match current schema — re-run 'logrecovery schema' to refresh", tableName)
+	return &Statement{
+		LSN:           rec.LSN,
+		TransactionID: rec.TransactionID,
+		Operation:     rec.Operation,
+		Table:         tableName,
+		SQL:           msg,
+		RollbackSQL:   msg,
+		SkipReason:    "SCHEMA_MISMATCH",
+	}
+}
+
+// lobSkip builds a Statement with SQL set to a comment and SkipReason = OFF_ROW_LOB_NOT_SUPPORTED.
+// SQL and RollbackSQL are not executable. The statement is emitted to preserve the audit trail
+// (LSN, transaction ID, table, operation) even though the LOB values cannot be recovered.
+func lobSkip(rec *logparser.LogRecord, tableName string) *Statement {
+	msg := fmt.Sprintf("-- OFF_ROW_LOB_NOT_SUPPORTED: %s contains off-row LOB data not recoverable from the log row image", tableName)
+	return &Statement{
+		LSN:           rec.LSN,
+		TransactionID: rec.TransactionID,
+		Operation:     rec.Operation,
+		Table:         tableName,
+		SQL:           msg,
+		RollbackSQL:   msg,
+		SkipReason:    "OFF_ROW_LOB_NOT_SUPPORTED",
+	}
+}
+
 func (g *Generator) insert(rec *logparser.LogRecord, t *schema.Table, tableName string) (*Statement, error) {
 	vals, err := rowdecoder.DecodeRow(rec.Contents0, t)
 	if err != nil {
+		if errors.Is(err, rowdecoder.ErrOffRowLOB) {
+			return lobSkip(rec, tableName), nil
+		}
+		if errors.Is(err, rowdecoder.ErrCompressedRow) {
+			return compressionSkip(rec, tableName, "COMPRESSED_ROW_NOT_SUPPORTED"), nil
+		}
+		if errors.Is(err, rowdecoder.ErrSchemaMismatch) {
+			return schemaMismatchSkip(rec, tableName), nil
+		}
 		return nil, fmt.Errorf("INSERT decode: %w", err)
 	}
 
@@ -107,6 +179,15 @@ func (g *Generator) delete(rec *logparser.LogRecord, t *schema.Table, tableName 
 	// Contents0 for LOP_DELETE_ROWS is the before-image (the deleted row).
 	vals, err := rowdecoder.DecodeRow(rec.Contents0, t)
 	if err != nil {
+		if errors.Is(err, rowdecoder.ErrOffRowLOB) {
+			return lobSkip(rec, tableName), nil
+		}
+		if errors.Is(err, rowdecoder.ErrCompressedRow) {
+			return compressionSkip(rec, tableName, "COMPRESSED_ROW_NOT_SUPPORTED"), nil
+		}
+		if errors.Is(err, rowdecoder.ErrSchemaMismatch) {
+			return schemaMismatchSkip(rec, tableName), nil
+		}
 		return nil, fmt.Errorf("DELETE decode: %w", err)
 	}
 
@@ -136,13 +217,25 @@ func (g *Generator) update(rec *logparser.LogRecord, t *schema.Table, tableName 
 	// Contents0 = after-image; Contents1 = XOR delta to reconstruct before-image.
 	afterVals, err := rowdecoder.DecodeRow(rec.Contents0, t)
 	if err != nil {
+		if errors.Is(err, rowdecoder.ErrOffRowLOB) {
+			return lobSkip(rec, tableName), nil
+		}
+		if errors.Is(err, rowdecoder.ErrCompressedRow) {
+			return compressionSkip(rec, tableName, "COMPRESSED_ROW_NOT_SUPPORTED"), nil
+		}
+		if errors.Is(err, rowdecoder.ErrSchemaMismatch) {
+			return schemaMismatchSkip(rec, tableName), nil
+		}
 		return nil, fmt.Errorf("UPDATE after decode: %w", err)
 	}
 
-	// LOP_MODIFY_ROW Contents0 is a positional delta (offset+len+bytes), not a full
-	// row image — DecodeRow returns all-NULLs in this case. Emit a comment instead of
-	// generating invalid SQL.
+	// LOP_MODIFY_ROW Contents0 is sometimes a positional delta (offset+len+bytes),
+	// not a full row image — DecodeRow returns all-NULLs in that case.
+	// Try to recover partial column values from the [Log Record] binary (SQL Server 2016+).
 	if allNull(afterVals) {
+		if delta := rowdecoder.ParseModifyRowDelta(rec.RawLogRecord, rec.Contents0, rec.Contents1, t); delta != nil {
+			return buildDeltaUpdate(rec, t, tableName, delta), nil
+		}
 		return &Statement{
 			LSN:           rec.LSN,
 			TransactionID: rec.TransactionID,
@@ -156,7 +249,13 @@ func (g *Generator) update(rec *logparser.LogRecord, t *schema.Table, tableName 
 	beforeData := rowdecoder.ReconstructBeforeImage(rec.Contents0, rec.Contents1)
 	beforeVals, err := rowdecoder.DecodeRow(beforeData, t)
 	if err != nil {
-		beforeVals = afterVals // fallback: no before-image available
+		if errors.Is(err, rowdecoder.ErrOffRowLOB) || errors.Is(err, rowdecoder.ErrCompressedRow) {
+			return lobSkip(rec, tableName), nil
+		}
+		if errors.Is(err, rowdecoder.ErrSchemaMismatch) {
+			return schemaMismatchSkip(rec, tableName), nil
+		}
+		beforeVals = afterVals // fallback: no before-image available for other decode errors
 	}
 
 	// Forward SQL: SET new values WHERE old PK.
@@ -303,4 +402,120 @@ func formatValue(v *rowdecoder.Value, typeID int) string {
 
 func escapeSQ(s string) string {
 	return strings.ReplaceAll(s, "'", "''")
+}
+
+// buildDeltaUpdate generates partial UPDATE SQL from a LOP_MODIFY_ROW delta.
+// For SQL Server 2016+: the changed region contains the before/after bytes for
+// specific columns. WHERE uses old values of changed columns (not guaranteed
+// unique without PK — noted in the SQL comment). If PK was also changed, we use
+// it for the WHERE instead.
+func buildDeltaUpdate(rec *logparser.LogRecord, t *schema.Table, tableName string, delta *rowdecoder.ModifyRowDelta) *Statement {
+	pkSet := make(map[int]bool, len(t.PKCols))
+	for _, cid := range t.PKCols {
+		pkSet[cid] = true
+	}
+
+	type colResult struct {
+		name   string
+		typeID int
+		before *rowdecoder.Value
+		after  *rowdecoder.Value
+		isPK   bool
+	}
+	var changed []colResult
+	for i, col := range t.Columns {
+		if delta.Before[i] == nil && delta.After[i] == nil {
+			continue
+		}
+		changed = append(changed, colResult{
+			name:   col.Name,
+			typeID: col.TypeID,
+			before: delta.Before[i],
+			after:  delta.After[i],
+			isPK:   pkSet[col.ColumnID],
+		})
+	}
+
+	if len(changed) == 0 {
+		msg := fmt.Sprintf("-- LOP_MODIFY_ROW on %s (offset=%d): delta parsed but no column values decoded", tableName, delta.RowOffset)
+		return &Statement{
+			LSN: rec.LSN, TransactionID: rec.TransactionID, Operation: "UPDATE", Table: tableName,
+			SQL: msg, RollbackSQL: msg,
+		}
+	}
+
+	// Build SET and WHERE parts.
+	var setFwd, setRbk []string
+	var whereFwd, whereRbk []string
+	var pkInDelta bool
+
+	for _, c := range changed {
+		colRef := "[" + c.name + "]"
+		newVal := "NULL"
+		if c.after != nil {
+			newVal = formatValue(c.after, c.typeID)
+		}
+		oldVal := "NULL"
+		if c.before != nil {
+			oldVal = formatValue(c.before, c.typeID)
+		}
+
+		setFwd = append(setFwd, fmt.Sprintf("%s = %s", colRef, newVal))
+		setRbk = append(setRbk, fmt.Sprintf("%s = %s", colRef, oldVal))
+
+		if c.isPK {
+			pkInDelta = true
+			if c.before != nil {
+				whereFwd = append(whereFwd, fmt.Sprintf("%s = %s", colRef, oldVal))
+			}
+			if c.after != nil {
+				whereRbk = append(whereRbk, fmt.Sprintf("%s = %s", colRef, newVal))
+			}
+		}
+	}
+
+	setFwdStr := strings.Join(setFwd, ", ")
+	setRbkStr := strings.Join(setRbk, ", ")
+
+	var forwardSQL, rollbackSQL string
+
+	if pkInDelta && len(whereFwd) > 0 {
+		forwardSQL = fmt.Sprintf("UPDATE %s SET %s WHERE %s;", tableName, setFwdStr, strings.Join(whereFwd, " AND "))
+		if len(whereRbk) > 0 {
+			rollbackSQL = fmt.Sprintf("UPDATE %s SET %s WHERE %s;", tableName, setRbkStr, strings.Join(whereRbk, " AND "))
+		} else {
+			rollbackSQL = fmt.Sprintf("-- UPDATE rollback on %s: PK after-value missing from delta", tableName)
+		}
+	} else {
+		// PK not in delta — use changed columns in WHERE (may not be unique)
+		var whereFromBefore []string
+		for _, c := range changed {
+			if c.before != nil {
+				whereFromBefore = append(whereFromBefore, fmt.Sprintf("[%s] = %s", c.name, formatValue(c.before, c.typeID)))
+			}
+		}
+		var whereFromAfter []string
+		for _, c := range changed {
+			if c.after != nil {
+				whereFromAfter = append(whereFromAfter, fmt.Sprintf("[%s] = %s", c.name, formatValue(c.after, c.typeID)))
+			}
+		}
+
+		safetyNote := fmt.Sprintf("-- PK not in log delta (offset=%d) — WHERE uses changed columns only; verify uniqueness before executing", delta.RowOffset)
+		if len(whereFromBefore) > 0 {
+			forwardSQL = fmt.Sprintf("%s\nUPDATE %s SET %s WHERE %s;", safetyNote, tableName, setFwdStr, strings.Join(whereFromBefore, " AND "))
+		} else {
+			forwardSQL = fmt.Sprintf("%s\n-- SET: UPDATE %s SET %s WHERE [pk] = ?;", safetyNote, tableName, setFwdStr)
+		}
+		if len(whereFromAfter) > 0 {
+			rollbackSQL = fmt.Sprintf("%s\nUPDATE %s SET %s WHERE %s;", safetyNote, tableName, setRbkStr, strings.Join(whereFromAfter, " AND "))
+		} else {
+			rollbackSQL = fmt.Sprintf("%s\n-- SET (rollback): UPDATE %s SET %s WHERE [pk] = ?;", safetyNote, tableName, setRbkStr)
+		}
+	}
+
+	return &Statement{
+		LSN: rec.LSN, TransactionID: rec.TransactionID, Operation: "UPDATE", Table: tableName,
+		SQL: forwardSQL, RollbackSQL: rollbackSQL,
+	}
 }

@@ -31,6 +31,10 @@ type LogRecord struct {
 	Contents2 []byte
 	Contents3 []byte
 	Contents4 []byte
+
+	// RawLogRecord is the complete log record binary from fn_dblog/fn_dump_dblog's
+	// [Log Record] column. Used for LOP_MODIFY_ROW offset parsing (SQL Server 2016+).
+	RawLogRecord []byte
 }
 
 // IsDataOp returns true for INSERT / DELETE / UPDATE operations.

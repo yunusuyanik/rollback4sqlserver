@@ -1,5 +1,12 @@
 package schema
 
+// DataCompression values — match sys.partitions.data_compression.
+const (
+	CompressionNone = 0
+	CompressionRow  = 1
+	CompressionPage = 2
+)
+
 // SQL Server system_type_id constants from sys.types
 const (
 	TypeBit              = 104
@@ -58,6 +65,12 @@ type Table struct {
 	Name     string    `json:"name"`
 	PKCols   []int     `json:"pk_cols"` // column_ids of PK columns in key order
 	Columns  []*Column `json:"columns"`
+
+	// DataCompression is from sys.partitions.data_compression for the base table partition
+	// (index_id 0 or 1). CompressionNone=0, CompressionRow=1, CompressionPage=2.
+	// Zero value (0) = NONE, which is the correct default for non-compressed tables.
+	// Re-run 'logrecovery schema' after changing table compression on the source server.
+	DataCompression int `json:"data_compression,omitempty"`
 }
 
 // Schema holds schema info for all user tables, indexed for fast lookup.

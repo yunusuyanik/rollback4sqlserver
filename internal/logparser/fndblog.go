@@ -76,7 +76,7 @@ func buildLiveQuery(startLSN, endLSN string, ops []string) string {
 	sb.WriteString("SELECT [Current LSN],[Operation],[Context],[Transaction ID],")
 	sb.WriteString("[AllocUnitName],[Begin time],[End time],")
 	sb.WriteString("[RowLog Contents 0],[RowLog Contents 1],[RowLog Contents 2],")
-	sb.WriteString("[RowLog Contents 3],[RowLog Contents 4]")
+	sb.WriteString("[RowLog Contents 3],[RowLog Contents 4],[Log Record]")
 	sb.WriteString(" FROM fn_dblog(")
 
 	if startLSN == "" {

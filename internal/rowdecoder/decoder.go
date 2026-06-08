@@ -13,7 +13,9 @@
 package rowdecoder
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -23,6 +25,36 @@ import (
 
 	"github.com/uns/mssqllogrecovery/internal/schema"
 )
+
+// ErrCompressedRow is returned by DecodeRow when the row image header does not
+// match the uncompressed heap/clustered format. This is the expected outcome for
+// ROW or PAGE compressed tables — the caller should emit COMPRESSED_ROW_NOT_SUPPORTED
+// instead of generating SQL.
+var ErrCompressedRow = errors.New("COMPRESSED_ROW_NOT_SUPPORTED")
+
+// ErrSchemaMismatch is returned by DecodeRow when the row's column count or
+// column_id layout is inconsistent with the current schema, indicating that the
+// schema was changed (DROP COLUMN, or a DROP+ADD combination that produces the
+// same column count but different physical layout) after this row was written.
+// The caller should emit SCHEMA_MISMATCH instead of generating SQL.
+//
+// Detection rules (applied before any column is decoded):
+//   - numCols (from row header) > len(t.Columns): row has more columns than
+//     current schema — a DROP happened after this row was written. The fixed-
+//     length area and variable-length offset array have extra entries at
+//     positions that computeLayout no longer accounts for.
+//   - numCols == len(t.Columns) AND column_ids have gaps: the same column count
+//     could be a new row (post-DROP layout) that happens to match an old row
+//     (pre-DROP layout) by count alone. With gaps we cannot determine which
+//     physical layout the row uses; treating it as ambiguous prevents wrong SQL.
+var ErrSchemaMismatch = errors.New("SCHEMA_MISMATCH")
+
+// ErrOffRowLOB is returned by DecodeRow when a non-null variable-length column
+// has bit 0x8000 set in its offset array entry, indicating the value is stored
+// off-row (LOB pages) and only a pointer descriptor is present in the row image.
+// Affected types: varchar(max), nvarchar(max), varbinary(max), text, ntext, image.
+// The caller should emit OFF_ROW_LOB_NOT_SUPPORTED instead of generating SQL.
+var ErrOffRowLOB = errors.New("OFF_ROW_LOB_NOT_SUPPORTED")
 
 // Value is a decoded column value.
 type Value struct {
@@ -38,16 +70,20 @@ func (v *Value) String() string {
 }
 
 // DecodeRow decodes all columns from a raw row image (Contents0 byte slice)
-// using the provided table schema.
+// using the provided table schema. Returns ErrCompressedRow if the row header
+// does not match the uncompressed format (foffset < 4 or > row length).
 func DecodeRow(data []byte, t *schema.Table) ([]*Value, error) {
 	if len(data) < 4 {
 		return nil, fmt.Errorf("row too short (%d bytes)", len(data))
 	}
 
 	// Foffset: end of fixed-length area (absolute from row start, includes the 4-byte header).
+	// For uncompressed rows foffset >= 4 always (the 4-byte header is part of the row).
+	// ROW/PAGE compressed rows store a CD array starting at data[0]; data[2:4] is not a
+	// valid Foffset and will typically decode to a value < 4 or > len(data).
 	foffset := int(binary.LittleEndian.Uint16(data[2:4]))
-	if foffset > len(data) {
-		foffset = len(data)
+	if foffset < 4 || foffset > len(data) {
+		return nil, fmt.Errorf("%w: foffset=%d len=%d", ErrCompressedRow, foffset, len(data))
 	}
 
 	// Number of columns stored in this row image.
@@ -55,6 +91,29 @@ func DecodeRow(data []byte, t *schema.Table) ([]*Value, error) {
 		return nil, fmt.Errorf("row truncated before NumColumns")
 	}
 	numCols := int(binary.LittleEndian.Uint16(data[foffset : foffset+2]))
+
+	// Schema-drift detection: compare the row's column count against the current schema.
+	//
+	// Case 1 — numCols > len(t.Columns): row was written before a DROP COLUMN. The
+	//   fixed-length area and var-offset array have extra slots that computeLayout no
+	//   longer accounts for; decoding would read wrong bytes for every column after the
+	//   first dropped one.
+	//
+	// Case 2 — numCols == len(t.Columns) with column_id gaps: a DROP+ADD cycle brought
+	//   the count back to the schema count, but the physical layout of old rows differs
+	//   from new rows. With gaps we cannot safely distinguish old from new rows by count
+	//   alone, so we treat this as ambiguous and refuse to decode.
+	hasGaps := false
+	for i, col := range t.Columns {
+		if col.ColumnID != i+1 {
+			hasGaps = true
+			break
+		}
+	}
+	if numCols > len(t.Columns) || (numCols == len(t.Columns) && hasGaps) {
+		return nil, fmt.Errorf("%w: row numCols=%d schema columns=%d hasGaps=%v",
+			ErrSchemaMismatch, numCols, len(t.Columns), hasGaps)
+	}
 
 	// NULL bitmap.
 	nbmapStart := foffset + 2
@@ -64,35 +123,45 @@ func DecodeRow(data []byte, t *schema.Table) ([]*Value, error) {
 	}
 	nbmap := data[nbmapStart : nbmapStart+nbmapLen]
 
-	isNull := func(columnID int) bool {
-		idx := columnID - 1 // column_id is 1-based
-		if idx < 0 || idx >= numCols {
+	// isNull uses the ordinal index (loop position i) — not column_id-1 — because
+	// the NULL bitmap bit positions are assigned sequentially by the SQL Server engine
+	// in the order columns appear on-row. After a DROP COLUMN the surviving columns
+	// keep their ordinal positions; using column_id-1 would read the wrong bitmap bit.
+	isNull := func(colIdx int) bool {
+		if colIdx < 0 || colIdx >= numCols {
 			return true
 		}
-		return nbmap[idx/8]&(1<<uint(idx%8)) != 0
+		return nbmap[colIdx/8]&(1<<uint(colIdx%8)) != 0
 	}
 
 	// Variable-length section.
 	afterNbmap := nbmapStart + nbmapLen
 	var varEndOffsets []int
+	var offRowMask []bool // offRowMask[i] == true → var-col i has off-row LOB storage
 	if afterNbmap+2 <= len(data) {
 		numVar := int(binary.LittleEndian.Uint16(data[afterNbmap : afterNbmap+2]))
 		offsetArrStart := afterNbmap + 2
 		varEndOffsets = make([]int, numVar)
+		offRowMask = make([]bool, numVar)
 		for i := 0; i < numVar; i++ {
 			pos := offsetArrStart + 2*i
 			if pos+2 > len(data) {
 				break
 			}
-			// High bit 0x8000 indicates off-row (complex) data; mask it.
-			varEndOffsets[i] = int(binary.LittleEndian.Uint16(data[pos:pos+2])) & 0x7FFF
+			raw := binary.LittleEndian.Uint16(data[pos : pos+2])
+			// Bit 15 (0x8000): off-row/complex storage. The bytes at the offset position
+			// are a LOB pointer (16 bytes for text/ntext/image, 24 bytes for *max types),
+			// not the actual column value. Record which var-cols are off-row; the column
+			// loop below will return ErrOffRowLOB rather than decoding the pointer as data.
+			offRowMask[i] = raw&0x8000 != 0
+			varEndOffsets[i] = int(raw & 0x7FFF)
 		}
 	}
 	varDataBase := afterNbmap + 2 + 2*len(varEndOffsets)
 
 	values := make([]*Value, len(t.Columns))
 	for i, col := range t.Columns {
-		if isNull(col.ColumnID) {
+		if isNull(i) {
 			values[i] = &Value{IsNull: true}
 			continue
 		}
@@ -102,6 +171,11 @@ func DecodeRow(data []byte, t *schema.Table) ([]*Value, error) {
 			if vi >= len(varEndOffsets) {
 				values[i] = &Value{IsNull: true}
 				continue
+			}
+			// Off-row flag set → only a LOB pointer is stored in the row, not the value.
+			// Decoding the pointer as column data would produce garbage SQL.
+			if vi < len(offRowMask) && offRowMask[vi] {
+				return nil, fmt.Errorf("%w: column %q (var index %d)", ErrOffRowLOB, col.Name, vi)
 			}
 			endOff := varEndOffsets[vi]
 			startOff := varDataBase
@@ -149,6 +223,109 @@ func DecodeRow(data []byte, t *schema.Table) ([]*Value, error) {
 		values[i] = &Value{Raw: raw}
 	}
 	return values, nil
+}
+
+// ModifyRowDelta holds decoded column values extracted from a LOP_MODIFY_ROW
+// delta record. Indexed by t.Columns position; nil = column not in the delta.
+type ModifyRowDelta struct {
+	RowOffset int      // byte offset within the row where the modification starts
+	Before    []*Value // before-values of columns in the changed region
+	After     []*Value // after-values of columns in the changed region
+}
+
+// ParseModifyRowDelta extracts before/after values for fixed-length columns
+// from a LOP_MODIFY_ROW log record binary (the [Log Record] column in fn_dblog).
+//
+// SQL Server 2016+ layout at the end of [Log Record]:
+//
+//	[...header...][RowOffset:2][OldLen:2][NewLen:2][OldData:OldLen][NewData:NewLen]
+//
+// OldData == Contents1, NewData == Contents0.  We fingerprint by verifying that
+// Contents0 and Contents1 appear verbatim at the end of the binary, then sanity-
+// check that the embedded lengths match.  Variable-length columns are skipped
+// (their positions shift with the delta; only fixed-length layout is stable).
+//
+// Returns nil when the binary format is not recognised — callers should fall
+// back to the existing allNull heuristic.
+func ParseModifyRowDelta(logRecord, c0, c1 []byte, t *schema.Table) *ModifyRowDelta {
+	rowOff, ok := findModifyRowOffset(logRecord, c0, c1)
+	if !ok {
+		return nil
+	}
+	c0l, c1l := len(c0), len(c1)
+
+	before := make([]*Value, len(t.Columns))
+	after := make([]*Value, len(t.Columns))
+
+	for i, col := range t.Columns {
+		if !col.IsFixed {
+			continue
+		}
+
+		if col.TypeID == schema.TypeBit {
+			bytePos := 4 + col.BitByteOffset
+			if bytePos >= rowOff && bytePos+1 <= rowOff+c1l && bytePos-rowOff < len(c1) {
+				b := (c1[bytePos-rowOff] >> uint(col.BitOffset)) & 1
+				before[i] = &Value{Raw: b == 1}
+			}
+			if bytePos >= rowOff && bytePos+1 <= rowOff+c0l && bytePos-rowOff < len(c0) {
+				b := (c0[bytePos-rowOff] >> uint(col.BitOffset)) & 1
+				after[i] = &Value{Raw: b == 1}
+			}
+			continue
+		}
+
+		colStart := 4 + col.FixedOffset
+		size := schema.FixedSize(col)
+		colEnd := colStart + size
+
+		if colStart >= rowOff && colEnd <= rowOff+c1l {
+			rel := colStart - rowOff
+			if rel+size <= len(c1) {
+				if raw, err := decodeFixed(col, c1[rel:rel+size]); err == nil {
+					before[i] = &Value{Raw: raw}
+				}
+			}
+		}
+		if colStart >= rowOff && colEnd <= rowOff+c0l {
+			rel := colStart - rowOff
+			if rel+size <= len(c0) {
+				if raw, err := decodeFixed(col, c0[rel:rel+size]); err == nil {
+					after[i] = &Value{Raw: raw}
+				}
+			}
+		}
+	}
+	return &ModifyRowDelta{RowOffset: rowOff, Before: before, After: after}
+}
+
+// findModifyRowOffset locates the row modification offset inside the raw [Log Record]
+// binary. It verifies that Contents0 (new bytes) sits at the very end and Contents1
+// (old bytes) sits immediately before it, then reads the 2-byte offset field that
+// precedes the length fields.
+func findModifyRowOffset(logRecord, c0, c1 []byte) (offset int, ok bool) {
+	n := len(logRecord)
+	c0l, c1l := len(c0), len(c1)
+	if c0l == 0 || c1l == 0 || n < c0l+c1l+6 {
+		return 0, false
+	}
+	if !bytes.Equal(logRecord[n-c0l:], c0) {
+		return 0, false
+	}
+	if !bytes.Equal(logRecord[n-c0l-c1l:n-c0l], c1) {
+		return 0, false
+	}
+	base := n - c0l - c1l
+	if base < 6 {
+		return 0, false
+	}
+	// Layout before [c1][c0]: [RowOffset:2][OldLen:2][NewLen:2]
+	oldLen := int(binary.LittleEndian.Uint16(logRecord[base-4 : base-2]))
+	newLen := int(binary.LittleEndian.Uint16(logRecord[base-2 : base]))
+	if oldLen != c1l || newLen != c0l {
+		return 0, false // length mismatch — layout assumption wrong
+	}
+	return int(binary.LittleEndian.Uint16(logRecord[base-6 : base-4])), true
 }
 
 // ReconstructBeforeImage attempts to reconstruct the before-image for
