@@ -505,7 +505,22 @@ func pollLDF(ctx context.Context, server, user, pass, dbName string) error {
 		r = r.WithLSNRange(startLSN, "")
 	}
 	if err := r.Read(scanOps(), handler); err != nil && err != context.Canceled {
-		return err
+		if startLSN != "" && strings.Contains(err.Error(), "Invalid parameter") {
+			// Checkpoint LSN is no longer in the active log (log was backed up/truncated).
+			// Clear checkpoint and retry from the beginning of the current log.
+			logf("[%s] checkpoint LSN stale (log truncated?) — resetting and scanning from current log start", dbName)
+			checkpointMu.Lock()
+			delete(ldfCheckpoint, dbName)
+			checkpointMu.Unlock()
+			maxLSN = ""
+			startLSN = ""
+			r2 := logparser.NewLDFReader(srcDB)
+			if err2 := r2.Read(scanOps(), handler); err2 != nil && err2 != context.Canceled {
+				return err2
+			}
+		} else {
+			return err
+		}
 	}
 	if maxLSN != "" && maxLSN != startLSN {
 		checkpointMu.Lock()
