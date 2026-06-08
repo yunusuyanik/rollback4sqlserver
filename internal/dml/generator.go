@@ -38,6 +38,11 @@ func (g *Generator) Generate(rec *logparser.LogRecord) (*Statement, error) {
 	if !rec.IsDataOp() {
 		return nil, nil
 	}
+	// NCI leaf/interior records contain index key tuples, not full row images.
+	// Decoding them with the base-table schema produces corrupt SQL.
+	if rec.Context != "LCX_HEAP" && rec.Context != "LCX_CLUSTERED" {
+		return nil, nil
+	}
 
 	t := g.sch.Lookup(rec.AllocUnitName)
 	if t == nil {
@@ -80,8 +85,13 @@ func (g *Generator) insert(rec *logparser.LogRecord, t *schema.Table, tableName 
 	forwardSQL := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s);", tableName, cols, placeholders)
 
 	// Rollback: delete the row that was inserted, matched by PK.
-	where := buildWhere(t, vals)
-	rollbackSQL := fmt.Sprintf("DELETE FROM %s WHERE %s;", tableName, where)
+	where, ok := buildWhere(t, vals)
+	var rollbackSQL string
+	if !ok {
+		rollbackSQL = fmt.Sprintf("-- INSERT rollback unsafe: PK columns not resolvable for %s — do not execute", tableName)
+	} else {
+		rollbackSQL = fmt.Sprintf("DELETE FROM %s WHERE %s;", tableName, where)
+	}
 
 	return &Statement{
 		LSN:           rec.LSN,
@@ -100,8 +110,13 @@ func (g *Generator) delete(rec *logparser.LogRecord, t *schema.Table, tableName 
 		return nil, fmt.Errorf("DELETE decode: %w", err)
 	}
 
-	where := buildWhere(t, vals)
-	forwardSQL := fmt.Sprintf("DELETE FROM %s WHERE %s;", tableName, where)
+	where, ok := buildWhere(t, vals)
+	var forwardSQL string
+	if !ok {
+		forwardSQL = fmt.Sprintf("-- DELETE unsafe: PK columns not resolvable for %s — do not execute", tableName)
+	} else {
+		forwardSQL = fmt.Sprintf("DELETE FROM %s WHERE %s;", tableName, where)
+	}
 
 	// Rollback: re-insert the deleted row with its original values.
 	cols, placeholders := colsAndValues(t.Columns, vals)
@@ -146,13 +161,23 @@ func (g *Generator) update(rec *logparser.LogRecord, t *schema.Table, tableName 
 
 	// Forward SQL: SET new values WHERE old PK.
 	set := buildSet(t.Columns, afterVals)
-	where := buildWhere(t, beforeVals)
-	forwardSQL := fmt.Sprintf("UPDATE %s SET %s WHERE %s;", tableName, set, where)
+	where, whereOK := buildWhere(t, beforeVals)
+	var forwardSQL string
+	if !whereOK {
+		forwardSQL = fmt.Sprintf("-- UPDATE unsafe: PK columns not resolvable for %s — do not execute", tableName)
+	} else {
+		forwardSQL = fmt.Sprintf("UPDATE %s SET %s WHERE %s;", tableName, set, where)
+	}
 
 	// Rollback SQL: SET old values back WHERE current (after) PK.
 	rollbackSet := buildSet(t.Columns, beforeVals)
-	rollbackWhere := buildWhere(t, afterVals)
-	rollbackSQL := fmt.Sprintf("UPDATE %s SET %s WHERE %s;", tableName, rollbackSet, rollbackWhere)
+	rollbackWhere, rollbackWhereOK := buildWhere(t, afterVals)
+	var rollbackSQL string
+	if !rollbackWhereOK {
+		rollbackSQL = fmt.Sprintf("-- UPDATE rollback unsafe: PK columns not resolvable for %s — do not execute", tableName)
+	} else {
+		rollbackSQL = fmt.Sprintf("UPDATE %s SET %s WHERE %s;", tableName, rollbackSet, rollbackWhere)
+	}
 
 	return &Statement{
 		LSN:           rec.LSN,
@@ -199,9 +224,11 @@ func buildSet(cols []*schema.Column, vals []*rowdecoder.Value) string {
 	return strings.Join(parts, ", ")
 }
 
-// buildWhere returns the WHERE clause for DELETE / UPDATE.
-// Uses PK columns if available, otherwise all non-null columns.
-func buildWhere(t *schema.Table, vals []*rowdecoder.Value) string {
+// buildWhere returns (whereClause, true) for DELETE / UPDATE.
+// Returns ("", false) when no safe WHERE can be built — callers must emit a
+// comment instead of executing the statement.
+// Uses PK columns if available, otherwise all columns.
+func buildWhere(t *schema.Table, vals []*rowdecoder.Value) (string, bool) {
 	pkSet := make(map[int]bool, len(t.PKCols))
 	for _, cid := range t.PKCols {
 		pkSet[cid] = true
@@ -224,9 +251,9 @@ func buildWhere(t *schema.Table, vals []*rowdecoder.Value) string {
 		}
 	}
 	if len(parts) == 0 {
-		return "1=1"
+		return "", false
 	}
-	return strings.Join(parts, " AND ")
+	return strings.Join(parts, " AND "), true
 }
 
 // formatValue converts a decoded value to its T-SQL literal representation.

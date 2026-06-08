@@ -44,9 +44,9 @@ type ScanProgress struct {
 // ── App state ─────────────────────────────────────────────────────────────────
 
 var (
-	appMu    sync.RWMutex
-	appStore *store.DuckDBStore
-	appSch   *schema.Schema
+	appMu      sync.RWMutex
+	appStore   *store.DuckDBStore
+	appSchemas = map[string]*schema.Schema{} // keyed by database name
 
 	scanMu   sync.Mutex
 	scanning atomic.Bool
@@ -225,7 +225,7 @@ func scanDatabase(ctx context.Context, server, user, pass, dbName string, sinceT
 		return fmt.Errorf("schema: %w", err)
 	}
 	appMu.Lock()
-	appSch = sch
+	appSchemas[dbName] = sch
 	appMu.Unlock()
 
 	appMu.RLock()
@@ -291,7 +291,7 @@ func pollLDF(ctx context.Context, server, user, pass, dbName string) error {
 	defer srcDB.Close()
 
 	appMu.RLock()
-	sch := appSch
+	sch := appSchemas[dbName]
 	st := appStore
 	appMu.RUnlock()
 	if sch == nil || st == nil {
@@ -1046,7 +1046,7 @@ func runScan(server, user, password, database, mode string, files []string, comm
 		return
 	}
 	appMu.Lock()
-	appSch = sch
+	appSchemas[database] = sch
 	appMu.Unlock()
 
 	appMu.RLock()
