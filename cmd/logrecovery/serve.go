@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/url"
 	"os"
@@ -506,14 +507,22 @@ func pollLDF(ctx context.Context, server, user, pass, dbName string) error {
 	}
 	if err := r.Read(scanOps(), handler); err != nil && err != context.Canceled {
 		if startLSN != "" && strings.Contains(err.Error(), "Invalid parameter") {
-			// Checkpoint LSN is no longer in the active log (log was backed up/truncated).
-			// Clear checkpoint and retry from the beginning of the current log.
-			logf("[%s] checkpoint LSN stale (log truncated?) — resetting and scanning from current log start", dbName)
+			// Checkpoint LSN is no longer in the active log: log was backed up and
+			// truncated. Fill the gap by scanning the covering TRN backup files, then
+			// resume live polling from the current log start.
+			logf("[%s] checkpoint LSN stale — filling gap from TRN backups", dbName)
+			n, gapErr := fillGapFromBackups(ctx, srcDB, dbName, startLSN, handler)
+			if gapErr != nil {
+				logf("[%s] gap-fill error: %v — events in gap may be missing", dbName, gapErr)
+			} else if n == 0 {
+				logf("[%s] no TRN backups found for gap — events in gap may be missing", dbName)
+			}
+			// Reset so the live-poll pass uses NULL (full current log) and the
+			// boundary-skip in the handler does not fire for stale LSN.
+			startLSN = ""
 			checkpointMu.Lock()
 			delete(ldfCheckpoint, dbName)
 			checkpointMu.Unlock()
-			maxLSN = ""
-			startLSN = ""
 			r2 := logparser.NewLDFReader(srcDB)
 			if err2 := r2.Read(scanOps(), handler); err2 != nil && err2 != context.Canceled {
 				return err2
@@ -1395,6 +1404,78 @@ func buildOrderBy(col, dir string) string {
 	}
 	// Secondary sort by id ensures stable ordering within ties.
 	return fmt.Sprintf(" ORDER BY %s %s NULLS LAST, id %s", c, d, d)
+}
+
+// ── Gap-fill helpers ──────────────────────────────────────────────────────────
+
+// hexLSNToDecimal converts a fn_dblog hex LSN "VVVVVVVV:BBBBBBBB:SSSS" to the
+// NUMERIC(25,0) decimal string stored in msdb.dbo.backupset first_lsn/last_lsn.
+// SQL Server encodes the 10-byte LSN as: vlf * 2^48 + block * 2^16 + slot.
+func hexLSNToDecimal(hexLSN string) (string, error) {
+	parts := strings.SplitN(hexLSN, ":", 3)
+	if len(parts) != 3 {
+		return "", fmt.Errorf("invalid LSN: %q", hexLSN)
+	}
+	vlf, err1 := strconv.ParseUint(strings.TrimSpace(parts[0]), 16, 64)
+	blk, err2 := strconv.ParseUint(strings.TrimSpace(parts[1]), 16, 64)
+	slot, err3 := strconv.ParseUint(strings.TrimSpace(parts[2]), 16, 64)
+	if err1 != nil || err2 != nil || err3 != nil {
+		return "", fmt.Errorf("invalid LSN hex: %q", hexLSN)
+	}
+	pow48 := new(big.Int).Lsh(big.NewInt(1), 48)
+	pow16 := new(big.Int).Lsh(big.NewInt(1), 16)
+	result := new(big.Int)
+	result.Mul(new(big.Int).SetUint64(vlf), pow48)
+	result.Add(result, new(big.Int).Mul(new(big.Int).SetUint64(blk), pow16))
+	result.Add(result, new(big.Int).SetUint64(slot))
+	return result.String(), nil
+}
+
+// fillGapFromBackups scans TRN log backup files that cover the LSN gap between
+// checkpointLSN and the current active log start, using fn_dump_dblog.
+// Returns the number of backup files found and scanned; 0 means no backups
+// covered the gap and events in the gap are lost.
+func fillGapFromBackups(ctx context.Context, srcDB *sql.DB, dbName, checkpointLSN string, handler func(*logparser.LogRecord) error) (int, error) {
+	decLSN, err := hexLSNToDecimal(checkpointLSN)
+	if err != nil {
+		return 0, fmt.Errorf("LSN convert: %w", err)
+	}
+
+	// Query msdb for all TRN backups whose last_lsn is at or after our
+	// checkpoint. Using 3-part name works from any database context.
+	rows, err := srcDB.QueryContext(ctx, `
+		SELECT bmf.physical_device_name
+		FROM msdb.dbo.backupset bs
+		JOIN msdb.dbo.backupmediafamily bmf ON bs.media_set_id = bmf.media_set_id
+		WHERE bs.database_name = @db
+		  AND bs.type = 'L'
+		  AND bs.last_lsn >= CONVERT(NUMERIC(25,0), @lsn)
+		ORDER BY bs.first_lsn`,
+		sql.Named("db", dbName),
+		sql.Named("lsn", decLSN))
+	if err != nil {
+		return 0, fmt.Errorf("msdb query: %w", err)
+	}
+	defer rows.Close()
+
+	var files []string
+	for rows.Next() {
+		var f string
+		rows.Scan(&f)
+		if f != "" {
+			files = append(files, f)
+		}
+	}
+	if len(files) == 0 {
+		return 0, nil
+	}
+
+	logf("[%s] gap-fill: scanning %d TRN file(s) from LSN %s", dbName, len(files), shortLSN(checkpointLSN))
+	r := logparser.NewTRNReader(srcDB, files).WithLSNRange(checkpointLSN, "")
+	if err := r.Read(scanOps(), handler); err != nil && err != context.Canceled {
+		return len(files), fmt.Errorf("gap-fill scan: %w", err)
+	}
+	return len(files), nil
 }
 
 // ── Connection helpers ────────────────────────────────────────────────────────
