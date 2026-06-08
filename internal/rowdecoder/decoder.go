@@ -197,14 +197,13 @@ func decodeFixed(col *schema.Column, b []byte) (interface{}, error) {
 
 	case schema.TypeSmallmoney:
 		v := int32(binary.LittleEndian.Uint32(b))
-		return float64(v) / 10000.0, nil
+		return formatMoneyScaled(int64(v)), nil
 
 	case schema.TypeMoney:
-		// High 4 bytes are the upper int, low 4 bytes are lower int (big-endian halves!).
+		// SQL Server stores MONEY as two LE int32 halves: [high][low].
 		hi := int64(int32(binary.LittleEndian.Uint32(b[0:4])))
 		lo := int64(binary.LittleEndian.Uint32(b[4:8]))
-		v := (hi << 32) | lo
-		return float64(v) / 10000.0, nil
+		return formatMoneyScaled((hi << 32) | lo), nil
 
 	case schema.TypeDatetime:
 		days := int32(binary.LittleEndian.Uint32(b[0:4]))
@@ -294,6 +293,28 @@ func decodeTime(b []byte, scale int) time.Time {
 	s := ns / int64(time.Second)
 	ns -= s * int64(time.Second)
 	return time.Date(0, 1, 1, int(h), int(m), int(s), int(ns), time.UTC)
+}
+
+// formatMoneyScaled formats a SQL Server MONEY or SMALLMONEY scaled integer
+// (4 implied decimal places) as an exact decimal string with no float64.
+// Handles the full MONEY range including MinInt64 via uint64 arithmetic.
+func formatMoneyScaled(scaled int64) string {
+	negative := scaled < 0
+	// uint64 conversion of a negative int64 via two's complement gives the
+	// correct absolute value even for MinInt64 (Go spec §Conversions).
+	var mag uint64
+	if negative {
+		mag = uint64(-scaled)
+	} else {
+		mag = uint64(scaled)
+	}
+	intPart := mag / 10000
+	fracPart := mag % 10000
+	result := fmt.Sprintf("%d.%04d", intPart, fracPart)
+	if negative {
+		result = "-" + result
+	}
+	return result
 }
 
 // decodeDecimal decodes a SQL Server decimal/numeric stored value into an
