@@ -505,20 +505,21 @@ func pollLDF(ctx context.Context, server, user, pass, dbName string) error {
 	if startLSN != "" {
 		r = r.WithLSNRange(startLSN, "")
 	}
+	// clearCheckpoint: set when gap-fill fails, meaning TRN files are gone and
+	// LSN-based checkpointing is unusable for this DB. Subsequent polls use NULL.
+	var clearCheckpoint bool
+
 	if err := r.Read(scanOps(), handler); err != nil && err != context.Canceled {
 		if startLSN != "" && strings.Contains(err.Error(), "Invalid parameter") {
-			// Checkpoint LSN is no longer in the active log: log was backed up and
-			// truncated. Fill the gap by scanning the covering TRN backup files, then
-			// resume live polling from the current log start.
 			logf("[%s] checkpoint LSN stale — filling gap from TRN backups", dbName)
+			logCheckpointLocation(srcDB, dbName, startLSN)
 			n, gapErr := fillGapFromBackups(ctx, srcDB, dbName, startLSN, handler)
 			if gapErr != nil {
-				logf("[%s] gap-fill error: %v — events in gap may be missing", dbName, gapErr)
+				logf("[%s] gap-fill failed (%v) — disabling LSN checkpoint; polling from NULL (ON CONFLICT handles duplicates)", dbName, gapErr)
+				clearCheckpoint = true
 			} else if n == 0 {
 				logf("[%s] no TRN backups found for gap — events in gap may be missing", dbName)
 			}
-			// Reset so the live-poll pass uses NULL (full current log) and the
-			// boundary-skip in the handler does not fire for stale LSN.
 			startLSN = ""
 			checkpointMu.Lock()
 			delete(ldfCheckpoint, dbName)
@@ -530,6 +531,14 @@ func pollLDF(ctx context.Context, server, user, pass, dbName string) error {
 		} else {
 			return err
 		}
+	}
+	if clearCheckpoint {
+		// Erase persisted checkpoint so all future polls (including after restart)
+		// use NULL. ON CONFLICT DO NOTHING suppresses duplicates.
+		if st != nil {
+			st.SaveCheckpoint(dbName, "")
+		}
+		return nil
 	}
 	if maxLSN != "" && maxLSN != startLSN {
 		checkpointMu.Lock()
@@ -632,12 +641,25 @@ func parseSince(s string) (time.Time, error) {
 	return time.Now().Add(-d), nil
 }
 
-// parseLogTime parses the SQL Server log timestamp "2024/01/15 10:00:01:000".
+// parseLogTime parses the SQL Server log timestamp "2024/01/15 10:00:01:123".
+// fn_dblog uses a colon before milliseconds; Go requires a dot. We normalize.
 func parseLogTime(s string) time.Time {
+	s = strings.TrimSpace(s)
 	if s == "" {
 		return time.Time{}
 	}
-	t, err := time.ParseInLocation("2006/01/02 15:04:05:000", s, time.Local)
+	// "YYYY/MM/DD HH:MM:SS:mmm" → "YYYY/MM/DD HH:MM:SS.mmm"
+	if len(s) == 23 && s[19] == ':' {
+		s = s[:19] + "." + s[20:]
+	}
+	if t, err := time.ParseInLocation("2006/01/02 15:04:05.000", s, time.Local); err == nil {
+		return t
+	}
+	// Fallback: without milliseconds
+	if len(s) > 19 {
+		s = s[:19]
+	}
+	t, err := time.ParseInLocation("2006/01/02 15:04:05", s, time.Local)
 	if err != nil {
 		return time.Time{}
 	}
@@ -1408,6 +1430,45 @@ func buildOrderBy(col, dir string) string {
 
 // ── Gap-fill helpers ──────────────────────────────────────────────────────────
 
+// logCheckpointLocation queries msdb to find and log which TRN backup file(s)
+// span the given checkpoint LSN, helping diagnose gap-fill failures.
+func logCheckpointLocation(srcDB *sql.DB, dbName, checkpointLSN string) {
+	decLSN, err := hexLSNToDecimal(checkpointLSN)
+	if err != nil {
+		return
+	}
+	rows, err := srcDB.QueryContext(context.Background(), `
+		SELECT TOP 3
+			bmf.physical_device_name,
+			CONVERT(VARCHAR(23), bs.backup_start_date, 120) AS started,
+			CAST(bs.first_lsn AS VARCHAR(50)) AS first_lsn,
+			CAST(bs.last_lsn  AS VARCHAR(50)) AS last_lsn
+		FROM msdb.dbo.backupset bs
+		JOIN msdb.dbo.backupmediafamily bmf ON bs.media_set_id = bmf.media_set_id
+		WHERE bs.database_name = @db
+		  AND bs.type = 'L'
+		  AND bs.first_lsn <= CONVERT(NUMERIC(25,0), @lsn)
+		  AND bs.last_lsn  >= CONVERT(NUMERIC(25,0), @lsn)
+		ORDER BY bs.backup_start_date DESC`,
+		sql.Named("db", dbName),
+		sql.Named("lsn", decLSN))
+	if err != nil {
+		logf("[%s] LSN location query error: %v", dbName, err)
+		return
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		var path, started, firstLSN, lastLSN string
+		rows.Scan(&path, &started, &firstLSN, &lastLSN)
+		logf("[%s] LSN %s is in backup: %s (taken %s)", dbName, shortLSN(checkpointLSN), path, started)
+		found = true
+	}
+	if !found {
+		logf("[%s] LSN %s not found in any backup in msdb — file may be deleted or LSN too recent", dbName, shortLSN(checkpointLSN))
+	}
+}
+
 // hexLSNToDecimal converts a fn_dblog hex LSN "VVVVVVVV:BBBBBBBB:SSSS" to the
 // NUMERIC(25,0) decimal string stored in msdb.dbo.backupset first_lsn/last_lsn.
 // SQL Server encodes the 10-byte LSN as: vlf * 2^48 + block * 2^16 + slot.
@@ -1441,15 +1502,17 @@ func fillGapFromBackups(ctx context.Context, srcDB *sql.DB, dbName, checkpointLS
 		return 0, fmt.Errorf("LSN convert: %w", err)
 	}
 
-	// Query msdb for all TRN backups whose last_lsn is at or after our
-	// checkpoint. Using 3-part name works from any database context.
+	// Query msdb for TRN backups that cover the gap. Limit to the last 7 days
+	// and at most 64 files (one fn_dump_dblog call) to avoid scanning stale
+	// or already-deleted backup files.
 	rows, err := srcDB.QueryContext(ctx, `
-		SELECT bmf.physical_device_name
+		SELECT TOP 64 bmf.physical_device_name
 		FROM msdb.dbo.backupset bs
 		JOIN msdb.dbo.backupmediafamily bmf ON bs.media_set_id = bmf.media_set_id
 		WHERE bs.database_name = @db
 		  AND bs.type = 'L'
 		  AND bs.last_lsn >= CONVERT(NUMERIC(25,0), @lsn)
+		  AND bs.backup_start_date >= DATEADD(day, -7, GETDATE())
 		ORDER BY bs.first_lsn`,
 		sql.Named("db", dbName),
 		sql.Named("lsn", decLSN))
