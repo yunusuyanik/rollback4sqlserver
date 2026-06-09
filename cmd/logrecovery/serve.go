@@ -343,6 +343,7 @@ func scanDatabase(ctx context.Context, server, user, pass, dbName string, sinceT
 	progMu.RUnlock()
 
 	var lastLog time.Time
+	var lastLoggedTotal int64
 
 	ops := scanOps()
 	handler := func(rec *logparser.LogRecord) error {
@@ -363,9 +364,10 @@ func scanDatabase(ctx context.Context, server, user, pass, dbName string, sinceT
 			tot := progress.Total
 			errs := progress.Errors
 			progMu.RUnlock()
-			if tot > snapTotal {
+			if tot > lastLoggedTotal {
 				logf("[%s] imported %s events · %d errors", dbName, fmtN(tot), errs)
 				lastLog = time.Now()
+				lastLoggedTotal = tot
 			}
 		}
 		return err
