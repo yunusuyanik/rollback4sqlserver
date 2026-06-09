@@ -123,11 +123,11 @@ tailwind.config = {
     </div>
     <div>
       <p class="font-bold text-stone-900 text-xl mb-1.5 tracking-tight">Connect to Local Agent</p>
-      <p class="text-stone-500 text-sm max-w-sm leading-relaxed">Start <span class="mono text-stone-700">logrecovery.exe serve</span> on your SQL Server host, enter its URL above and click Connect.</p>
+      <p class="text-stone-500 text-sm max-w-sm leading-relaxed">Start <span class="mono text-stone-700">logrecovery.exe</span> on your SQL Server host, enter its URL above and click Connect.</p>
     </div>
     <div class="bg-white border border-stone-200 rounded-xl p-4 text-left max-w-md w-full shadow-sm">
       <p class="text-[10px] text-stone-400 mb-2.5 font-bold uppercase tracking-widest">Quick start</p>
-      <pre class="mono text-xs text-stone-600 leading-relaxed whitespace-pre-wrap">.\logrecovery.exe serve ^
+      <pre class="mono text-xs text-stone-600 leading-relaxed whitespace-pre-wrap">.\logrecovery.exe ^
   --host ".\SQLEXPRESS" ^
   --user sa --pass *** ^
   --all-dbs --since 24h</pre>
@@ -141,19 +141,26 @@ tailwind.config = {
     <!-- FILTERS -->
     <div class="bg-white border border-stone-200 rounded-xl px-4 py-3 mb-3 flex flex-wrap gap-2 items-center shadow-sm">
 
-      <!-- Op toggles -->
-      <div class="flex items-center gap-1">
-        <template x-for="op in ['INSERT','UPDATE','DELETE']" :key="op">
-          <button @click="toggleOp(op)"
-            :class="filters.op === op
-              ? (op==='INSERT' ? 'bg-green-50 text-green-700 border-green-300'
-                : op==='UPDATE' ? 'bg-amber-50 text-amber-700 border-amber-300'
-                : 'bg-red-50 text-red-700 border-red-300')
-              : 'bg-stone-50 text-stone-500 border-stone-200 hover:text-stone-700 hover:border-stone-300'"
-            class="px-2.5 py-1 rounded-lg text-[10px] font-bold uppercase tracking-widest border transition"
-            x-text="op">
-          </button>
-        </template>
+      <!-- Op checkboxes (multi-select) -->
+      <div class="flex items-center gap-3 px-2.5 py-1.5 bg-stone-50 border border-stone-200 rounded-lg">
+        <label class="flex items-center gap-1.5 cursor-pointer select-none">
+          <input type="checkbox" :checked="filters.ops.includes('INSERT')" @change="toggleOp('INSERT')"
+            class="rounded border-stone-300 accent-green-600 w-3.5 h-3.5">
+          <span class="text-[10px] font-bold uppercase tracking-widest"
+            :class="filters.ops.includes('INSERT') ? 'text-green-700' : 'text-stone-400'">INSERT</span>
+        </label>
+        <label class="flex items-center gap-1.5 cursor-pointer select-none">
+          <input type="checkbox" :checked="filters.ops.includes('UPDATE')" @change="toggleOp('UPDATE')"
+            class="rounded border-stone-300 accent-amber-600 w-3.5 h-3.5">
+          <span class="text-[10px] font-bold uppercase tracking-widest"
+            :class="filters.ops.includes('UPDATE') ? 'text-amber-700' : 'text-stone-400'">UPDATE</span>
+        </label>
+        <label class="flex items-center gap-1.5 cursor-pointer select-none">
+          <input type="checkbox" :checked="filters.ops.includes('DELETE')" @change="toggleOp('DELETE')"
+            class="rounded border-stone-300 accent-red-600 w-3.5 h-3.5">
+          <span class="text-[10px] font-bold uppercase tracking-widest"
+            :class="filters.ops.includes('DELETE') ? 'text-red-700' : 'text-stone-400'">DELETE</span>
+        </label>
       </div>
 
       <div class="w-px h-5 bg-stone-200 shrink-0"></div>
@@ -491,7 +498,7 @@ function dashboard() {
     sortCol: 'event_time',
     sortDir: 'desc',
 
-    filters: { db:'', table:'', op:'', from:'', to:'', search:'' },
+    filters: { db:'', table:'', ops:[], from:'', to:'', search:'' },
 
     selectedIds: [],
     selectedEvs: {},
@@ -516,7 +523,7 @@ function dashboard() {
     get allSelected() { return this.events.length > 0 && this.selectedIds.length === this.events.length },
     get hasActiveFilters() {
       const f = this.filters;
-      return !!(f.db || f.table || f.op || f.from || f.to || f.search);
+      return !!(f.db || f.table || f.ops.length || f.from || f.to || f.search);
     },
 
     // Timeline
@@ -610,7 +617,7 @@ function dashboard() {
           dir:    this.sortDir,
           db:     this.filters.db,
           table:  this.filters.table,
-          op:     this.filters.op,
+          op:     this.filters.ops.join(','),
           search: this.filters.search,
           since:  this.filters.from ? new Date(this.filters.from).toISOString() : '',
           until:  this.filters.to   ? new Date(this.filters.to).toISOString()   : '',
@@ -665,12 +672,14 @@ function dashboard() {
     },
 
     toggleOp(op) {
-      this.filters.op = this.filters.op === op ? '' : op;
+      const idx = this.filters.ops.indexOf(op);
+      if (idx >= 0) this.filters.ops.splice(idx, 1);
+      else this.filters.ops.push(op);
       this.resetAndLoad();
     },
 
     clearFilters() {
-      this.filters = { db:'', table:'', op:'', from:'', to:'', search:'' };
+      this.filters = { db:'', table:'', ops:[], from:'', to:'', search:'' };
       this.resetAndLoad();
     },
 
@@ -776,10 +785,12 @@ function dashboard() {
       if (!ts) return '—';
       const d    = new Date(ts);
       const diff = (Date.now() - d.getTime()) / 1000;
-      if (diff < 60)    return `${Math.floor(diff)}s ago`;
-      if (diff < 3600)  return `${Math.floor(diff/60)}m ago`;
-      if (diff < 86400) return `${Math.floor(diff/3600)}h ago`;
-      return d.toLocaleDateString(undefined, { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' });
+      const p    = n => String(n).padStart(2, '0');
+      const dt   = `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+      if (diff < 60)    return `${dt} · ${Math.floor(diff)}s ago`;
+      if (diff < 3600)  return `${dt} · ${Math.floor(diff/60)}m ago`;
+      if (diff < 86400) return `${dt} · ${Math.floor(diff/3600)}h ago`;
+      return dt;
     },
   }
 }

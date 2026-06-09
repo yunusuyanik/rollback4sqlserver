@@ -1370,8 +1370,18 @@ func buildWhere(op, db, sch, tbl, search, since, until string) (string, []interf
 	var conds []string
 	var args []interface{}
 	if op != "" {
-		conds = append(conds, "operation = ?")
-		args = append(args, op)
+		ops := strings.Split(op, ",")
+		if len(ops) == 1 {
+			conds = append(conds, "operation = ?")
+			args = append(args, strings.TrimSpace(ops[0]))
+		} else {
+			placeholders := make([]string, len(ops))
+			for i, o := range ops {
+				placeholders[i] = "?"
+				args = append(args, strings.TrimSpace(o))
+			}
+			conds = append(conds, "operation IN ("+strings.Join(placeholders, ",")+")")
+		}
 	}
 	if db != "" {
 		conds = append(conds, "db_name = ?")
