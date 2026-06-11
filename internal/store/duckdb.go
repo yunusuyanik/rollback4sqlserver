@@ -144,7 +144,7 @@ func (s *DuckDBStore) runTTLCleanup() {
 		fmt.Fprintf(os.Stderr, "warn: ttl flush: %v\n", err)
 		return
 	}
-	cutoff := fmt.Sprintf("NOW() - INTERVAL '%d DAYS'", ttlDays)
+	cutoff := fmt.Sprintf("NOW()::TIMESTAMP - INTERVAL '%d DAYS'", ttlDays)
 	res, err := s.db.Exec(fmt.Sprintf(
 		"DELETE FROM log_events WHERE event_time IS NOT NULL AND event_time < %s", cutoff,
 	))
