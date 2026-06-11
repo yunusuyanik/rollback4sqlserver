@@ -45,15 +45,6 @@ func calcDuckDBMaxMemory() string {
 	return fmt.Sprintf("%dMB", mb)
 }
 
-// dbFilePath returns the DuckDB file path from AGENT_DB_PATH env var,
-// defaulting to "./data/agent_metrics.db" relative to the binary.
-func dbFilePath() string {
-	if p := os.Getenv("AGENT_DB_PATH"); p != "" {
-		return p
-	}
-	return "" // empty = in-memory (default for serve mode)
-}
-
 // PersistentDBPath returns the configured file path for persistent mode.
 // Returns "" when in-memory mode is desired.
 func PersistentDBPath() string {
@@ -181,7 +172,8 @@ func (s *DuckDBStore) setupSchema() error {
 			primary_key  VARCHAR,
 			sql_stmt     VARCHAR,
 			rollback_sql VARCHAR,
-			event_time   TIMESTAMP
+			event_time   TIMESTAMP,
+			commit_time  TIMESTAMP
 		)`,
 		// checkpoints persists the last-seen LSN per database for restart recovery.
 		`CREATE TABLE IF NOT EXISTS checkpoints (
@@ -201,6 +193,9 @@ func (s *DuckDBStore) setupSchema() error {
 			return err
 		}
 	}
+
+	// Migration: add commit_time column if missing (existing databases).
+	s.db.Exec(`ALTER TABLE log_events ADD COLUMN IF NOT EXISTS commit_time TIMESTAMP`)
 
 	// Migration: ensure UNIQUE(db_name, lsn) to prevent duplicates on restart.
 	// Step 1: remove any existing duplicates (idempotent — no-op when table is clean).
@@ -239,8 +234,8 @@ func (s *DuckDBStore) beginBatch() error {
 	// This is the second line of defence against duplicates; the primary defence is
 	// the LSN checkpoint in scanDatabase / pollLDF.
 	stmt, err := tx.Prepare(`INSERT INTO log_events
-		(lsn, txn_id, operation, db_name, schema_name, table_name, sql_stmt, rollback_sql, event_time)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(lsn, txn_id, operation, db_name, schema_name, table_name, sql_stmt, rollback_sql, event_time, commit_time)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (db_name, lsn) DO NOTHING`)
 	if err != nil {
 		tx.Rollback()
@@ -266,14 +261,17 @@ func (s *DuckDBStore) Write(st *dml.Statement) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	schName, tblName := splitSchemaTable(st.Table)
-	var eventTime interface{}
+	var eventTime, commitTime interface{}
 	if !st.Timestamp.IsZero() {
 		eventTime = st.Timestamp.UTC().Format(time.RFC3339Nano)
+	}
+	if !st.CommitTime.IsZero() {
+		commitTime = st.CommitTime.UTC().Format(time.RFC3339Nano)
 	}
 	if _, err := s.stmt.Exec(
 		st.LSN, st.TransactionID, st.Operation,
 		st.Database, schName, tblName,
-		st.SQL, st.RollbackSQL, eventTime,
+		st.SQL, st.RollbackSQL, eventTime, commitTime,
 	); err != nil {
 		return err
 	}

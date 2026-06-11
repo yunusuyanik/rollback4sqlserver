@@ -102,10 +102,11 @@ tailwind.config = {
 
     <div class="flex-1"></div>
 
-    <!-- Polling indicator -->
+    <!-- Pulling indicator -->
     <div x-show="connected && polling" x-cloak class="flex items-center gap-1.5 text-[10px] text-stone-400 font-semibold uppercase tracking-widest">
-      <span class="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse inline-block"></span>
-      Polling
+      <span class="w-1.5 h-1.5 rounded-full inline-block transition-colors duration-150"
+        :class="pulling ? 'bg-green-500 animate-pulse' : 'bg-stone-300 opacity-40'"></span>
+      Pulling
     </div>
 
   </div>
@@ -241,7 +242,7 @@ tailwind.config = {
     <div class="bg-white border border-stone-200 rounded-xl px-5 pt-3.5 pb-4 mb-3 shadow-sm select-none">
       <div class="flex items-center justify-between mb-3">
         <div class="flex items-center gap-3">
-          <span class="text-[10px] font-bold uppercase tracking-widest text-stone-400">Last 3 Hours</span>
+          <span class="text-[10px] font-bold uppercase tracking-widest text-stone-400">Last 12 Hours</span>
           <div class="flex items-center gap-1.5 text-[9px] mono text-stone-300">
             <span class="w-2 h-2 rounded-full bg-green-500 inline-block"></span>INSERT
             <span class="w-2 h-2 rounded-full bg-amber-500 inline-block ml-1"></span>UPDATE
@@ -505,6 +506,7 @@ function dashboard() {
 
     loading:       false,
     polling:       false,
+    pulling:       false,
     pollingTimer:  null,
     lastTotal:     0,
     newLsns:       [],
@@ -528,12 +530,12 @@ function dashboard() {
 
     // Timeline
     timelineNow:      Date.now(),
-    timelineWindowMs: 3 * 60 * 60 * 1000,
+    timelineWindowMs: 12 * 60 * 60 * 1000,
 
     get timelineStart() { return this.timelineNow - this.timelineWindowMs; },
 
     get timelineTicks() {
-      const step = 30 * 60 * 1000;
+      const step = 60 * 60 * 1000;
       const ticks = [];
       let t = Math.ceil(this.timelineStart / step) * step;
       while (t < this.timelineNow) {
@@ -645,21 +647,26 @@ function dashboard() {
       this.polling   = true;
       this.lastTotal = this.totalCount;
       this.pollingTimer = setInterval(async () => {
-        await this.loadStats();
-        const newTotal = this.stats.total || 0;
-        if (newTotal !== this.lastTotal) {
-          this.lastTotal = newTotal;
-          if (this.page === 1) {
-            const oldLsns = new Set(this.events.map(e => e.lsn));
-            await this.loadEvents();
-            const fresh = this.events.filter(e => !oldLsns.has(e.lsn)).map(e => e.lsn);
-            if (fresh.length) {
-              this.newLsns = fresh;
-              setTimeout(() => { this.newLsns = []; }, 3000);
+        this.pulling = true;
+        try {
+          await this.loadStats();
+          const newTotal = this.stats.total || 0;
+          if (newTotal !== this.lastTotal) {
+            this.lastTotal = newTotal;
+            if (this.page === 1) {
+              const oldLsns = new Set(this.events.map(e => e.lsn));
+              await this.loadEvents();
+              const fresh = this.events.filter(e => !oldLsns.has(e.lsn)).map(e => e.lsn);
+              if (fresh.length) {
+                this.newLsns = fresh;
+                setTimeout(() => { this.newLsns = []; }, 3000);
+              }
+            } else {
+              this.totalCount = newTotal;
             }
-          } else {
-            this.totalCount = newTotal;
           }
+        } finally {
+          this.pulling = false;
         }
       }, 5000);
     },

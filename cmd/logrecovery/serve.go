@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -345,7 +344,6 @@ func scanDatabase(ctx context.Context, server, user, pass, dbName string, sinceT
 	var lastLog time.Time
 	var lastLoggedTotal int64
 
-	ops := scanOps()
 	handler := func(rec *logparser.LogRecord) error {
 		select {
 		case <-ctx.Done():
@@ -375,9 +373,9 @@ func scanDatabase(ctx context.Context, server, user, pass, dbName string, sinceT
 
 	r := logparser.NewLDFReader(srcDB)
 	if resumeLSN != "" {
-		r = r.WithLSNRange(resumeLSN, "")
+		r = r.WithStartLSN(resumeLSN)
 	}
-	if err := r.Read(ops, handler); err != nil && err != context.Canceled {
+	if err := r.Read(handler); err != nil && err != context.Canceled {
 		return err
 	}
 	if maxLSN != "" {
@@ -490,13 +488,6 @@ func pollLDF(ctx context.Context, server, user, pass, dbName string) error {
 			return context.Canceled
 		default:
 		}
-		if rec.LSN == startLSN {
-			// Skip the boundary record: it was the last record of the previous
-			// poll cycle and is already stored. Data records for in-flight
-			// transactions at the boundary are preserved in state.pending from
-			// the previous cycle — they will be flushed when their COMMIT arrives.
-			return nil
-		}
 		if rec.LSN > maxLSN {
 			maxLSN = rec.LSN
 		}
@@ -505,13 +496,13 @@ func pollLDF(ctx context.Context, server, user, pass, dbName string) error {
 
 	r := logparser.NewLDFReader(srcDB)
 	if startLSN != "" {
-		r = r.WithLSNRange(startLSN, "")
+		r = r.WithStartLSN(startLSN)
 	}
 	// clearCheckpoint: set when gap-fill fails, meaning TRN files are gone and
 	// LSN-based checkpointing is unusable for this DB. Subsequent polls use NULL.
 	var clearCheckpoint bool
 
-	if err := r.Read(scanOps(), handler); err != nil && err != context.Canceled {
+	if err := r.Read(handler); err != nil && err != context.Canceled {
 		if startLSN != "" && strings.Contains(err.Error(), "Invalid parameter") {
 			logf("[%s] checkpoint LSN stale — filling gap from TRN backups", dbName)
 			logCheckpointLocation(srcDB, dbName, startLSN)
@@ -527,7 +518,7 @@ func pollLDF(ctx context.Context, server, user, pass, dbName string) error {
 			delete(ldfCheckpoint, dbName)
 			checkpointMu.Unlock()
 			r2 := logparser.NewLDFReader(srcDB)
-			if err2 := r2.Read(scanOps(), handler); err2 != nil && err2 != context.Canceled {
+			if err2 := r2.Read(handler); err2 != nil && err2 != context.Canceled {
 				return err2
 			}
 		} else {
@@ -573,8 +564,9 @@ func handleScanRecord(
 
 	case logparser.OpCommitXact:
 		bt := beginTimes[rec.TransactionID]
-		if bt.IsZero() && rec.EndTime != "" {
-			bt = parseLogTime(rec.EndTime)
+		commitTime := parseLogTime(rec.EndTime)
+		if bt.IsZero() {
+			bt = commitTime
 		}
 		if !sinceTime.IsZero() && !bt.IsZero() && bt.Before(sinceTime) {
 			delete(pending, rec.TransactionID)
@@ -583,6 +575,7 @@ func handleScanRecord(
 		}
 		for _, stmt := range pending[rec.TransactionID] {
 			stmt.Timestamp = bt
+			stmt.CommitTime = commitTime
 			stmt.Database = dbName
 			writeToStore(st, stmt, allowed)
 		}
@@ -738,6 +731,7 @@ func buildMux() http.Handler {
 	// Utilities
 	mux.HandleFunc("/api/browse", handleBrowse)
 	mux.HandleFunc("/api/query", handleQuery)
+	mux.HandleFunc("/api/reload-schema", handleReloadSchema)
 
 	return corsMiddleware(mux)
 }
@@ -943,7 +937,7 @@ func handleLogs(w http.ResponseWriter, r *http.Request) {
 
 	orderBy := buildOrderBy(q.Get("sort"), q.Get("dir"))
 	rows, err := conn.Query(
-		"SELECT lsn, txn_id, operation, db_name, schema_name, table_name, sql_stmt, rollback_sql, event_time FROM log_events"+
+		"SELECT lsn, txn_id, operation, db_name, schema_name, table_name, sql_stmt, rollback_sql, event_time, commit_time FROM log_events"+
 			where+orderBy+fmt.Sprintf(" LIMIT %d OFFSET %d", limit, off),
 		args...)
 	if err != nil {
@@ -980,7 +974,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 	conn.QueryRow("SELECT count(*) FROM log_events"+where, args...).Scan(&total)
 
 	rows, err := conn.Query(
-		"SELECT lsn, txn_id, operation, db_name, schema_name, table_name, sql_stmt, rollback_sql, event_time FROM log_events"+
+		"SELECT lsn, txn_id, operation, db_name, schema_name, table_name, sql_stmt, rollback_sql, event_time, commit_time FROM log_events"+
 			where+fmt.Sprintf(" ORDER BY event_time DESC NULLS LAST, id DESC LIMIT %d OFFSET %d", limit, off),
 		args...)
 	if err != nil {
@@ -1014,7 +1008,7 @@ func handleEvents(w http.ResponseWriter, r *http.Request) {
 	conn.QueryRow("SELECT count(*) FROM log_events"+where, args...).Scan(&total)
 
 	rows, err := conn.Query(
-		"SELECT lsn, txn_id, operation, db_name, schema_name, table_name, sql_stmt, rollback_sql, event_time FROM log_events"+
+		"SELECT lsn, txn_id, operation, db_name, schema_name, table_name, sql_stmt, rollback_sql, event_time, commit_time FROM log_events"+
 			where+fmt.Sprintf(" ORDER BY id LIMIT %d OFFSET %d", limit, off),
 		args...)
 	if err != nil {
@@ -1036,20 +1030,24 @@ type logEvent struct {
 	Table       string  `json:"table_name"`
 	SQL         string  `json:"sql_stmt"`
 	RollbackSQL string  `json:"rollback_sql,omitempty"`
-	EventTime   *string `json:"event_time,omitempty"`
+	EventTime   *string `json:"event_time,omitempty"`  // transaction begin time
+	CommitTime  *string `json:"commit_time,omitempty"` // transaction commit time
 }
 
 func scanEventRows(rows *sql.Rows) []logEvent {
 	var out []logEvent
 	for rows.Next() {
 		var e logEvent
-		var rb, ts sql.NullString
-		rows.Scan(&e.LSN, &e.TxnID, &e.Operation, &e.Database, &e.SchemaName, &e.Table, &e.SQL, &rb, &ts)
+		var rb, ts, ct sql.NullString
+		rows.Scan(&e.LSN, &e.TxnID, &e.Operation, &e.Database, &e.SchemaName, &e.Table, &e.SQL, &rb, &ts, &ct)
 		if rb.Valid {
 			e.RollbackSQL = rb.String
 		}
 		if ts.Valid && ts.String != "" {
 			e.EventTime = &ts.String
+		}
+		if ct.Valid && ct.String != "" {
+			e.CommitTime = &ct.String
 		}
 		out = append(out, e)
 	}
@@ -1165,6 +1163,51 @@ func handleBrowse(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{"path": dir, "entries": result})
 }
 
+// POST /api/reload-schema — re-extracts schema from SQL Server (picks up new tables).
+func handleReloadSchema(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", 405)
+		return
+	}
+	sessMu.RLock()
+	server, user, password := sessServer, sessUser, sessPassword
+	sessMu.RUnlock()
+	if server == "" {
+		writeJSON(w, map[string]interface{}{"error": "not connected"})
+		return
+	}
+	appMu.RLock()
+	dbs := make([]string, 0, len(appSchemas))
+	for db := range appSchemas {
+		dbs = append(dbs, db)
+	}
+	appMu.RUnlock()
+	if len(dbs) == 0 {
+		writeJSON(w, map[string]interface{}{"error": "no databases scanned yet"})
+		return
+	}
+	refreshed := map[string]int{}
+	for _, dbName := range dbs {
+		srcDB, err := openConnection(server, user, password, dbName)
+		if err != nil {
+			writeJSON(w, map[string]interface{}{"error": fmt.Sprintf("%s: %v", dbName, err)})
+			return
+		}
+		sch, err := schema.Extract(srcDB)
+		srcDB.Close()
+		if err != nil {
+			writeJSON(w, map[string]interface{}{"error": fmt.Sprintf("%s schema: %v", dbName, err)})
+			return
+		}
+		appMu.Lock()
+		appSchemas[dbName] = sch
+		appMu.Unlock()
+		refreshed[dbName] = len(sch.Tables)
+		logf("[%s] schema reloaded: %d tables", dbName, len(sch.Tables))
+	}
+	writeJSON(w, map[string]interface{}{"ok": true, "tables": refreshed})
+}
+
 // POST /api/query  body: {"sql": "SELECT ..."}
 func handleQuery(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -1229,7 +1272,7 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rows, err := s.DB().Query(
-		`SELECT lsn, txn_id, operation, db_name, schema_name, table_name, sql_stmt, rollback_sql, event_time FROM log_events ORDER BY id`)
+		`SELECT lsn, txn_id, operation, db_name, schema_name, table_name, sql_stmt, rollback_sql, event_time, commit_time FROM log_events ORDER BY id`)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -1243,8 +1286,8 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 	enc := json.NewEncoder(w)
 	for rows.Next() {
 		var lsn, txn, op, dbName, schName, tblName, sqlStr string
-		var rollbackSQL, eventTime sql.NullString
-		rows.Scan(&lsn, &txn, &op, &dbName, &schName, &tblName, &sqlStr, &rollbackSQL, &eventTime)
+		var rollbackSQL, eventTime, commitTime sql.NullString
+		rows.Scan(&lsn, &txn, &op, &dbName, &schName, &tblName, &sqlStr, &rollbackSQL, &eventTime, &commitTime)
 		rec := map[string]string{
 			"lsn": lsn, "txn_id": txn, "operation": op,
 			"db": dbName, "schema": schName, "table": tblName, "sql": sqlStr,
@@ -1254,6 +1297,9 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 		}
 		if eventTime.Valid {
 			rec["event_time"] = eventTime.String
+		}
+		if commitTime.Valid {
+			rec["commit_time"] = commitTime.String
 		}
 		enc.Encode(rec)
 	}
@@ -1311,7 +1357,7 @@ func runScan(server, user, password, database, mode string, files []string, comm
 	switch mode {
 	case "ldf", "live":
 		setProgress(func(p *ScanProgress) { p.Message = "Reading live log (fn_dblog)…" })
-		scanErr = logparser.NewLDFReader(srcDB).Read(scanOps(), handler)
+		scanErr = logparser.NewLDFReader(srcDB).Read(handler)
 	default:
 		setProgress(func(p *ScanProgress) { p.Message = fmt.Sprintf("Reading %d TRN file(s)…", len(files)) })
 		scanErr = logparser.NewTRNReader(srcDB, files).Read(scanOps(), handler)
@@ -1673,13 +1719,3 @@ func queryInt(s string, def int) int {
 	return n
 }
 
-func openBrowser(u string) {
-	switch runtime.GOOS {
-	case "windows":
-		exec.Command("cmd", "/c", "start", u).Start()
-	case "darwin":
-		exec.Command("open", u).Start()
-	default:
-		exec.Command("xdg-open", u).Start()
-	}
-}

@@ -4,21 +4,16 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
-	"time"
 
 	_ "github.com/microsoft/go-mssqldb"
 )
 
 // LDFReader reads live transaction log records from fn_dblog on a running
-// SQL Server instance. It uses read-only SELECT — no DML/DDL.
-//
-// Load impact: fn_dblog reads from the in-memory log buffer + log file.
-// Use WithDelay to throttle between chunks.
+// SQL Server instance. Always calls fn_dblog(NULL,NULL) filtered by
+// WHERE [Current LSN] > startLSN. Read-only — no DML/DDL.
 type LDFReader struct {
 	db       *sql.DB
-	startLSN string
-	endLSN   string
-	delay    time.Duration // sleep between LSN chunks (0 = no throttle)
+	startLSN string // exclusive lower bound ("" = from active-log head)
 }
 
 // NewLDFReader constructs a reader against the given connection.
@@ -26,24 +21,17 @@ func NewLDFReader(db *sql.DB) *LDFReader {
 	return &LDFReader{db: db}
 }
 
-// WithLSNRange restricts the scan.
-func (r *LDFReader) WithLSNRange(startLSN, endLSN string) *LDFReader {
-	r.startLSN = startLSN
-	r.endLSN = endLSN
+// WithStartLSN sets an exclusive lower bound. Records with [Current LSN] <= lsn
+// are not returned. Use "" to read from the beginning of the active log.
+func (r *LDFReader) WithStartLSN(lsn string) *LDFReader {
+	r.startLSN = lsn
 	return r
 }
 
-// WithDelay adds a sleep between calls to reduce server load.
-func (r *LDFReader) WithDelay(d time.Duration) *LDFReader {
-	r.delay = d
-	return r
-}
-
-// Read streams log records. Same semantics as TRNReader.Read.
-func (r *LDFReader) Read(ops []string, fn func(*LogRecord) error) error {
-	query := buildLiveQuery(r.startLSN, r.endLSN, ops)
-
-	rows, err := r.db.Query(query)
+// Read streams relevant log records from fn_dblog(NULL,NULL) in natural log order.
+// The handler fn is called for each record; returning an error stops iteration.
+func (r *LDFReader) Read(fn func(*LogRecord) error) error {
+	rows, err := r.db.Query(buildLiveQuery(r.startLSN))
 	if err != nil {
 		return fmt.Errorf("fn_dblog: %w", err)
 	}
@@ -63,42 +51,35 @@ func (r *LDFReader) Read(ops []string, fn func(*LogRecord) error) error {
 		if err := fn(rec); err != nil {
 			return err
 		}
-		if r.delay > 0 {
-			time.Sleep(r.delay)
-		}
 	}
 	return rows.Err()
 }
 
-func buildLiveQuery(startLSN, endLSN string, ops []string) string {
+// buildLiveQuery builds the fn_dblog(NULL,NULL) SELECT with a compound WHERE:
+//   - Control records (LOP_BEGIN_XACT / LOP_COMMIT_XACT / LOP_ABORT_XACT):
+//     no context or allocation-unit restriction.
+//   - Data records (INSERT / DELETE / UPDATE / MODIFY_COLUMNS):
+//     restricted to LCX_HEAP and LCX_CLUSTERED, with sys.* and
+//     "Unknown Alloc Unit" names excluded at SQL level.
+//
+// afterLSN is an exclusive lower bound (empty = read from active-log head).
+func buildLiveQuery(afterLSN string) string {
 	var sb strings.Builder
-
 	sb.WriteString("SELECT [Current LSN],[Operation],[Context],[Transaction ID],")
 	sb.WriteString("[AllocUnitName],[Begin time],[End time],")
 	sb.WriteString("[RowLog Contents 0],[RowLog Contents 1],[RowLog Contents 2],")
 	sb.WriteString("[RowLog Contents 3],[RowLog Contents 4],[Log Record]")
-	sb.WriteString(" FROM fn_dblog(")
-
-	if startLSN == "" {
-		sb.WriteString("NULL")
-	} else {
-		fmt.Fprintf(&sb, "N'%s'", escapeSQ(startLSN))
+	sb.WriteString(" FROM fn_dblog(NULL,NULL)")
+	sb.WriteString(" WHERE (")
+	sb.WriteString("[Operation] IN (N'LOP_BEGIN_XACT',N'LOP_COMMIT_XACT',N'LOP_ABORT_XACT')")
+	sb.WriteString(" OR (")
+	sb.WriteString("[Operation] IN (N'LOP_INSERT_ROWS',N'LOP_DELETE_ROWS',N'LOP_MODIFY_ROW',N'LOP_MODIFY_COLUMNS')")
+	sb.WriteString(" AND [Context] IN (N'LCX_HEAP',N'LCX_CLUSTERED')")
+	sb.WriteString(" AND ISNULL([AllocUnitName],N'') NOT LIKE N'sys.%'")
+	sb.WriteString(" AND ISNULL([AllocUnitName],N'') NOT LIKE N'Unknown Alloc Unit%'")
+	sb.WriteString("))")
+	if afterLSN != "" {
+		fmt.Fprintf(&sb, " AND [Current LSN]>N'%s'", escapeSQ(afterLSN))
 	}
-	sb.WriteString(",")
-	if endLSN == "" {
-		sb.WriteString("NULL")
-	} else {
-		fmt.Fprintf(&sb, "N'%s'", escapeSQ(endLSN))
-	}
-	sb.WriteString(")")
-
-	if len(ops) > 0 {
-		quoted := make([]string, len(ops))
-		for i, op := range ops {
-			quoted[i] = "'" + escapeSQ(op) + "'"
-		}
-		fmt.Fprintf(&sb, " WHERE [Operation] IN (%s)", strings.Join(quoted, ","))
-	}
-
 	return sb.String()
 }

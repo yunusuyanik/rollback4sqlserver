@@ -21,6 +21,7 @@ type Statement struct {
 	SQL           string    // forward SQL — replays what happened
 	RollbackSQL   string    // inverse SQL — undoes what happened
 	Timestamp     time.Time // transaction begin time from LOP_BEGIN_XACT
+	CommitTime    time.Time // transaction commit time from LOP_COMMIT_XACT
 	Database      string    // SQL Server database name
 
 	// SkipReason is non-empty when SQL generation was intentionally suppressed.
@@ -81,7 +82,7 @@ func (g *Generator) Generate(rec *logparser.LogRecord) (*Statement, error) {
 		return &Statement{
 			LSN:           rec.LSN,
 			TransactionID: rec.TransactionID,
-			Operation:     rec.Operation,
+			Operation:     "UPDATE",
 			Table:         tableName,
 			SQL:           fmt.Sprintf("-- LOP_MODIFY_COLUMNS on %s (complex update, not decoded)", tableName),
 		}, nil
@@ -97,11 +98,23 @@ func compressionSkip(rec *logparser.LogRecord, tableName, reason string) *Statem
 	return &Statement{
 		LSN:           rec.LSN,
 		TransactionID: rec.TransactionID,
-		Operation:     rec.Operation,
+		Operation:     logOpToOperation(rec.Operation),
 		Table:         tableName,
 		SQL:           msg,
 		RollbackSQL:   msg,
 		SkipReason:    reason,
+	}
+}
+
+// logOpToOperation maps a raw fn_dblog operation name to a logical DML operation name.
+func logOpToOperation(op string) string {
+	switch op {
+	case logparser.OpInsertRows:
+		return "INSERT"
+	case logparser.OpDeleteRows:
+		return "DELETE"
+	default: // LOP_MODIFY_ROW, LOP_MODIFY_COLUMNS
+		return "UPDATE"
 	}
 }
 
@@ -114,7 +127,7 @@ func schemaMismatchSkip(rec *logparser.LogRecord, tableName string) *Statement {
 	return &Statement{
 		LSN:           rec.LSN,
 		TransactionID: rec.TransactionID,
-		Operation:     rec.Operation,
+		Operation:     logOpToOperation(rec.Operation),
 		Table:         tableName,
 		SQL:           msg,
 		RollbackSQL:   msg,
@@ -130,7 +143,7 @@ func lobSkip(rec *logparser.LogRecord, tableName string) *Statement {
 	return &Statement{
 		LSN:           rec.LSN,
 		TransactionID: rec.TransactionID,
-		Operation:     rec.Operation,
+		Operation:     logOpToOperation(rec.Operation),
 		Table:         tableName,
 		SQL:           msg,
 		RollbackSQL:   msg,
