@@ -22,18 +22,18 @@ const (
 )
 
 // calcDuckDBMaxMemory computes the DuckDB memory limit:
-//   - Total system RAM / 100
+//   - Total system RAM / 20  (5%)
 //   - Hard cap at 2 GB
-//   - Minimum 64 MB (safeguard on low-RAM machines)
+//   - Minimum 256 MB (DuckDB needs headroom for WAL + sort buffers)
 func calcDuckDBMaxMemory() string {
 	total := totalSystemMemoryBytes()
 	if total == 0 {
-		return "128MB"
+		return "256MB"
 	}
-	limit := total / 100
+	limit := total / 20
 	const (
 		maxCap = uint64(2 * 1024 * 1024 * 1024) // 2 GB
-		minMB  = uint64(64)
+		minMB  = uint64(256)
 	)
 	if limit > maxCap {
 		limit = maxCap
