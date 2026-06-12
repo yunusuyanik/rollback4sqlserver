@@ -260,23 +260,46 @@ tailwind.config = {
                :style="`left: ${tick.pct * 100}%`"></div>
         </template>
 
-        <!-- Density histogram bars -->
-        <template x-for="bucket in timelineBuckets" :key="bucket.i">
-          <div class="absolute bottom-0 flex flex-col justify-end overflow-hidden"
-               :style="`left: ${bucket.pct * 100}%; width: ${bucket.w * 100}%`"
-               :title="`${bucket.label}: ${bucket.total} events · ${bucket.insert} ins · ${bucket.update} upd · ${bucket.delete} del`">
-            <div class="bg-red-500"   :style="`height: ${bucket.delH}px`"></div>
-            <div class="bg-amber-400" :style="`height: ${bucket.updH}px`"></div>
-            <div class="bg-green-500" :style="`height: ${bucket.insH}px`"></div>
-          </div>
-        </template>
-
         <!-- Baseline -->
         <div class="absolute bottom-0 left-0 right-0 h-px bg-stone-200"></div>
+
+        <!-- Lollipops: one stick+dot per non-empty 10-min cluster -->
+        <template x-for="b in timelineBuckets" :key="b.i">
+          <div class="absolute bottom-0 -translate-x-1/2 flex flex-col items-center justify-end cursor-pointer group"
+               style="height: 100%; width: 16px"
+               :style="`left: ${b.pct * 100}%`"
+               @mouseenter="tlHover = b" @mouseleave="tlHover = null"
+               @click="selectFromBucket(b)">
+            <!-- dot -->
+            <div class="rounded-full border-2 border-white shadow-sm transition-transform group-hover:scale-125"
+                 :style="`width: ${b.dotR*2}px; height: ${b.dotR*2}px`"
+                 :class="{
+                   'bg-green-500': b.dom === 'INSERT',
+                   'bg-amber-400': b.dom === 'UPDATE',
+                   'bg-red-500':   b.dom === 'DELETE',
+                 }"></div>
+            <!-- stick -->
+            <div class="w-0.5 bg-stone-300 group-hover:bg-stone-400"
+                 :style="`height: ${b.stickH}px`"></div>
+          </div>
+        </template>
 
         <!-- NOW marker -->
         <div class="absolute right-0 top-0 bottom-0 flex items-end">
           <div class="w-0.5 h-8 bg-stone-500 rounded-full"></div>
+        </div>
+
+        <!-- Hover tooltip -->
+        <div x-show="tlHover" x-cloak
+             class="absolute -top-1 -translate-y-full -translate-x-1/2 z-30 pointer-events-none
+                    bg-stone-900 text-white text-[10px] mono rounded-lg px-2.5 py-1.5 shadow-lg whitespace-nowrap"
+             :style="`left: ${(tlHover?.pct||0) * 100}%`">
+          <div class="font-semibold text-stone-300 mb-0.5" x-text="tlHover?.label + ' · ' + (tlHover?.total||0) + ' events'"></div>
+          <div class="flex gap-2">
+            <span class="text-green-400" x-text="(tlHover?.insert||0) + ' ins'"></span>
+            <span class="text-amber-400" x-text="(tlHover?.update||0) + ' upd'"></span>
+            <span class="text-red-400"   x-text="(tlHover?.delete||0) + ' del'"></span>
+          </div>
         </div>
       </div>
 
@@ -526,6 +549,7 @@ function dashboard() {
     timelineNow:      Date.now(),
     timelineWindowMs: 12 * 60 * 60 * 1000,
     timelineRawEvents: [],
+    tlHover:          null,
 
     get timelineStart() { return this.timelineNow - this.timelineWindowMs; },
 
@@ -564,14 +588,12 @@ function dashboard() {
     get timelineBuckets() {
       const N = 72; // 10-min buckets over 12h
       const bucketMs = this.timelineWindowMs / N;
-      const buckets = Array.from({ length: N }, (_, i) => ({
+      const raw = Array.from({ length: N }, (_, i) => ({
         i,
-        pct: i / N,
-        w: 1 / N,
+        pct: (i + 0.5) / N,            // center of bucket
         startT: this.timelineStart + i * bucketMs,
         insert: 0, update: 0, delete: 0, total: 0,
-        insH: 0, updH: 0, delH: 0,
-        label: '', totalH: 0,
+        lsns: [],
       }));
 
       for (const ev of this.timelineRawEvents) {
@@ -579,24 +601,30 @@ function dashboard() {
         const t = new Date(ev.event_time).getTime();
         const idx = Math.floor((t - this.timelineStart) / bucketMs);
         if (idx < 0 || idx >= N) continue;
-        const b = buckets[idx];
+        const b = raw[idx];
         if (ev.operation === 'INSERT') b.insert++;
         else if (ev.operation === 'UPDATE') b.update++;
         else if (ev.operation === 'DELETE') b.delete++;
         b.total++;
+        b.lsns.push(ev.lsn);
       }
 
-      const maxTotal = Math.max(...buckets.map(b => b.total), 1);
-      const maxH = 36;
-      for (const b of buckets) {
-        b.label = new Date(b.startT).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
-        if (b.total === 0) continue;
-        const totalH = Math.max(4, Math.round((Math.log(b.total + 1) / Math.log(maxTotal + 1)) * maxH));
-        b.insH = Math.round((b.insert / b.total) * totalH);
-        b.updH = Math.round((b.update / b.total) * totalH);
-        b.delH = totalH - b.insH - b.updH;
-      }
-      return buckets;
+      const filled = raw.filter(b => b.total > 0);
+      const maxTotal = Math.max(...filled.map(b => b.total), 1);
+      const maxH = 32, minH = 6;
+
+      return filled.map(b => {
+        const stickH = Math.round(minH + (Math.log(b.total + 1) / Math.log(maxTotal + 1)) * (maxH - minH));
+        const dotR   = Math.round(4 + (Math.log(b.total + 1) / Math.log(maxTotal + 1)) * 4); // 4–8px radius
+        // dominant op decides dot color
+        const m = [['INSERT', b.insert], ['UPDATE', b.update], ['DELETE', b.delete]]
+          .sort((a, c) => c[1] - a[1])[0][0];
+        return {
+          ...b,
+          stickH, dotR, dom: m,
+          label: new Date(b.startT).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }),
+        };
+      });
     },
 
     tlPosX(t) {
@@ -615,6 +643,19 @@ function dashboard() {
         const el = document.querySelector(`[data-lsn="${CSS.escape(lsn)}"]`);
         if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
       }, 50);
+    },
+
+    // Click a lollipop → filter feed to that 10-min window.
+    selectFromBucket(b) {
+      const bucketMs = this.timelineWindowMs / 72;
+      this.filters.from = this.toLocalInput(b.startT);
+      this.filters.to   = this.toLocalInput(b.startT + bucketMs);
+      this.resetAndLoad();
+    },
+
+    toLocalInput(ms) {
+      const d = new Date(ms - new Date(ms).getTimezoneOffset() * 60000);
+      return d.toISOString().slice(0, 16);
     },
 
     init() {
