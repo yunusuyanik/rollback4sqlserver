@@ -253,36 +253,30 @@ tailwind.config = {
       </div>
 
       <!-- Track area -->
-      <div class="relative h-6 mb-1">
-        <!-- Background track -->
-        <div class="absolute top-1/2 left-0 right-0 h-px bg-stone-200 -translate-y-1/2"></div>
-
-        <!-- 30-min tick lines -->
+      <div class="relative h-10 mb-1">
+        <!-- Hour tick lines -->
         <template x-for="tick in timelineTicks" :key="tick.t">
           <div class="absolute top-0 bottom-0 w-px bg-stone-100"
                :style="`left: ${tick.pct * 100}%`"></div>
         </template>
 
-        <!-- Event dots -->
-        <template x-for="ev in timelineEvents" :key="ev.lsn">
-          <div class="absolute w-3 h-3 rounded-full -translate-x-1/2 top-1/2 -translate-y-1/2 cursor-pointer border-2 border-white z-10 transition-all hover:scale-150"
-            :style="`left: ${tlPosX(ev.t) * 100}%`"
-            :class="{
-              'bg-green-500':  ev.op === 'INSERT',
-              'bg-red-600':    ev.op === 'DELETE',
-              'bg-amber-500':  ev.op === 'UPDATE',
-              'bg-stone-400':  !['INSERT','UPDATE','DELETE'].includes(ev.op),
-              'ring-2 ring-offset-1 ring-brand-400 scale-125': selectedIds.includes(ev.lsn),
-              'ring-2 ring-offset-1 ring-red-400 scale-125 animate-pulse': newLsns.includes(ev.lsn),
-            }"
-            @click="selectFromTimeline(ev.lsn)"
-            :title="`${ev.op} · ${ev.table} · ${ev.timeLabel}`">
+        <!-- Density histogram bars -->
+        <template x-for="bucket in timelineBuckets" :key="bucket.i">
+          <div class="absolute bottom-0 flex flex-col justify-end overflow-hidden"
+               :style="`left: ${bucket.pct * 100}%; width: ${bucket.w * 100}%`"
+               :title="`${bucket.label}: ${bucket.total} events · ${bucket.insert} ins · ${bucket.update} upd · ${bucket.delete} del`">
+            <div class="bg-red-500"   :style="`height: ${bucket.delH}px`"></div>
+            <div class="bg-amber-400" :style="`height: ${bucket.updH}px`"></div>
+            <div class="bg-green-500" :style="`height: ${bucket.insH}px`"></div>
           </div>
         </template>
 
+        <!-- Baseline -->
+        <div class="absolute bottom-0 left-0 right-0 h-px bg-stone-200"></div>
+
         <!-- NOW marker -->
-        <div class="absolute right-0 top-0 bottom-0 flex items-center">
-          <div class="w-0.5 h-5 bg-stone-500 rounded-full"></div>
+        <div class="absolute right-0 top-0 bottom-0 flex items-end">
+          <div class="w-0.5 h-8 bg-stone-500 rounded-full"></div>
         </div>
       </div>
 
@@ -565,6 +559,44 @@ function dashboard() {
           timeLabel: new Date(ev.event_time).toLocaleTimeString(),
         }))
         .filter(ev => ev.t >= start && ev.t <= end);
+    },
+
+    get timelineBuckets() {
+      const N = 72; // 10-min buckets over 12h
+      const bucketMs = this.timelineWindowMs / N;
+      const buckets = Array.from({ length: N }, (_, i) => ({
+        i,
+        pct: i / N,
+        w: 1 / N,
+        startT: this.timelineStart + i * bucketMs,
+        insert: 0, update: 0, delete: 0, total: 0,
+        insH: 0, updH: 0, delH: 0,
+        label: '', totalH: 0,
+      }));
+
+      for (const ev of this.timelineRawEvents) {
+        if (!ev.event_time) continue;
+        const t = new Date(ev.event_time).getTime();
+        const idx = Math.floor((t - this.timelineStart) / bucketMs);
+        if (idx < 0 || idx >= N) continue;
+        const b = buckets[idx];
+        if (ev.operation === 'INSERT') b.insert++;
+        else if (ev.operation === 'UPDATE') b.update++;
+        else if (ev.operation === 'DELETE') b.delete++;
+        b.total++;
+      }
+
+      const maxTotal = Math.max(...buckets.map(b => b.total), 1);
+      const maxH = 36;
+      for (const b of buckets) {
+        b.label = new Date(b.startT).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+        if (b.total === 0) continue;
+        const totalH = Math.max(2, Math.round((b.total / maxTotal) * maxH));
+        b.insH = Math.round((b.insert / b.total) * totalH);
+        b.updH = Math.round((b.update / b.total) * totalH);
+        b.delH = totalH - b.insH - b.updH;
+      }
+      return buckets;
     },
 
     tlPosX(t) {
