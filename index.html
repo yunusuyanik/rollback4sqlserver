@@ -531,6 +531,7 @@ function dashboard() {
     // Timeline
     timelineNow:      Date.now(),
     timelineWindowMs: 12 * 60 * 60 * 1000,
+    timelineRawEvents: [],
 
     get timelineStart() { return this.timelineNow - this.timelineWindowMs; },
 
@@ -554,7 +555,7 @@ function dashboard() {
     get timelineEvents() {
       const start = this.timelineStart;
       const end   = this.timelineNow;
-      return this.events
+      return this.timelineRawEvents
         .filter(ev => ev.event_time)
         .map(ev => ({
           lsn:       ev.lsn,
@@ -599,6 +600,7 @@ function dashboard() {
         this.connected = true;
         localStorage.setItem('agentUrl', this.agentUrl);
         await this.loadEvents();
+        await this.loadTimelineEvents();
         this.startPolling();
       } catch (e) {
         this.connected    = false;
@@ -636,6 +638,29 @@ function dashboard() {
       }
     },
 
+    async loadTimelineEvents() {
+      if (!this.connected) return;
+      try {
+        const since = new Date(this.timelineStart).toISOString();
+        const p = new URLSearchParams({
+          limit: 5000,
+          offset: 0,
+          sort: 'event_time',
+          dir: 'asc',
+          db: this.filters.db,
+          table: this.filters.table,
+          op: this.filters.ops.join(','),
+          search: this.filters.search,
+          since,
+          until: this.filters.to ? new Date(this.filters.to).toISOString() : '',
+        });
+        const r = await fetch(`${this.agentUrl}/api/logs?${p}`);
+        if (!r.ok) return;
+        const d = await r.json();
+        this.timelineRawEvents = d.events || [];
+      } catch {}
+    },
+
     async loadStats() {
       try {
         const r = await fetch(`${this.agentUrl}/api/stats`);
@@ -653,6 +678,7 @@ function dashboard() {
           const newTotal = this.stats.total || 0;
           if (newTotal !== this.lastTotal) {
             this.lastTotal = newTotal;
+            await this.loadTimelineEvents();
             if (this.page === 1) {
               const oldLsns = new Set(this.events.map(e => e.lsn));
               await this.loadEvents();
@@ -695,6 +721,7 @@ function dashboard() {
       this.selectedIds = [];
       this.selectedEvs = {};
       this.loadEvents();
+      this.loadTimelineEvents();
     },
 
     prevPage() { if (this.page > 1)               { this.page--; this.loadEvents(); } },
