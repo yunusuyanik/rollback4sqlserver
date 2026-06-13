@@ -123,3 +123,55 @@ func TestHandleTimelineBuckets(t *testing.T) {
 		t.Fatalf("bucket36=%+v want upd1 total1", got)
 	}
 }
+
+// Mirrors the exact browser call: fractional-second ISO timestamps, until=now,
+// empty db/table/op filters. Guards against RFC3339 fractional-second parse or
+// CAST(... 'Z' ...) regressions that would silently empty the timeline.
+func TestHandleTimelineRealClientCall(t *testing.T) {
+	st, err := store.OpenDuckDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	now := time.Now().UTC()
+	for i, op := range []string{"INSERT", "UPDATE", "DELETE", "UPDATE"} {
+		if err := st.Write(&dml.Statement{
+			LSN: "00000001:00000001:000" + string(rune('1'+i)), TransactionID: "0000:0001",
+			Operation: op, Table: "[dbo].[T]", Database: "db", SQL: op + " ...",
+			Timestamp: now.Add(-time.Duration(i+1) * time.Hour),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	appMu.Lock()
+	appStore = st
+	appMu.Unlock()
+	defer func() { appMu.Lock(); appStore = nil; appMu.Unlock() }()
+
+	// Fractional-second ISO, like new Date(..).toISOString().
+	since := now.Add(-12 * time.Hour).Format("2006-01-02T15:04:05.000Z07:00")
+	until := now.Format("2006-01-02T15:04:05.000Z07:00")
+	u := "/api/timeline?buckets=72&db=&table=&op=&search=&since=" + since + "&until=" + until
+	rec := httptest.NewRecorder()
+	handleTimeline(rec, httptest.NewRequest("GET", u, nil))
+	if rec.Code != 200 {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Data []struct{ Insert, Update, Delete, Total int } `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	total := 0
+	for _, b := range resp.Data {
+		total += b.Total
+	}
+	if total != 4 {
+		t.Fatalf("total events=%d want 4 (timeline empty → bug)", total)
+	}
+}

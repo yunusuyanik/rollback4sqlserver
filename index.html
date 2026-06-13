@@ -250,6 +250,7 @@ tailwind.config = {
           </div>
         </div>
         <div class="flex items-center gap-3">
+          <span x-show="timelineErr" x-cloak class="text-[10px] mono text-red-500" x-text="timelineErr"></span>
           <span class="text-[10px] mono text-stone-400" x-text="timelineTotalCount.toLocaleString() + ' events'"></span>
           <span class="text-[10px] mono text-stone-400 font-semibold" x-text="fmtTlTime(timelineNow)"></span>
         </div>
@@ -586,6 +587,7 @@ function dashboard() {
     timelineWindowMs: 12 * 60 * 60 * 1000,
     timelineData:     [],   // server-side per-bucket counts [{insert,update,delete,total}]
     timelineBuckets_N: 72,
+    timelineErr:      '',   // last /api/timeline fetch error (shown in header)
     tlHover:          null,
     tlDesign:         1,    // 1=lollipop  2=stacked bars  3=ridgeline area
 
@@ -761,10 +763,12 @@ function dashboard() {
           until,
         });
         const r = await fetch(`${this.agentUrl}/api/timeline?${p}`);
-        if (!r.ok) return;
+        if (!r.ok) { this.timelineErr = `timeline HTTP ${r.status}`; return; }
         const d = await r.json();
         this.timelineData = d.data || [];
-      } catch {}
+        const tot = this.timelineData.reduce((s, x) => s + (x.total||0), 0);
+        this.timelineErr = tot === 0 ? 'timeline: 0 rows in window' : '';
+      } catch (e) { this.timelineErr = 'timeline: ' + (e?.message || 'fetch failed'); }
     },
 
     async loadStats() {

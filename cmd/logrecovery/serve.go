@@ -1287,11 +1287,15 @@ func handleTimeline(w http.ResponseWriter, r *http.Request) {
 	if buckets < 1 || buckets > 2000 {
 		buckets = 72
 	}
-	since, err1 := time.Parse(time.RFC3339, q.Get("since"))
+	// Default to the last 12h when since/until are missing or unparseable,
+	// so a malformed client request degrades to a sane window instead of 400/empty.
 	until, err2 := time.Parse(time.RFC3339, q.Get("until"))
-	if err1 != nil || err2 != nil || !until.After(since) {
-		http.Error(w, "since/until must be valid RFC3339 with until>since", http.StatusBadRequest)
-		return
+	if err2 != nil {
+		until = time.Now().UTC()
+	}
+	since, err1 := time.Parse(time.RFC3339, q.Get("since"))
+	if err1 != nil || !until.After(since) {
+		since = until.Add(-12 * time.Hour)
 	}
 	sinceMs := since.UnixMilli()
 	untilMs := until.UnixMilli()
