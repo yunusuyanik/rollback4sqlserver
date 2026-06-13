@@ -45,22 +45,28 @@ func calcDuckDBMaxMemory() string {
 	return fmt.Sprintf("%dMB", mb)
 }
 
-// PersistentDBPath returns the configured file path for persistent mode.
-// Returns "" when in-memory mode is desired.
-func PersistentDBPath() string {
-	if p := os.Getenv("AGENT_DB_PATH"); p != "" {
-		return p
+// ResolveDBPath returns the DuckDB file path to use.
+// Priority: dataDir flag → ./data/ next to executable.
+func ResolveDBPath(dataDir string) string {
+	if dataDir != "" {
+		return filepath.Join(dataDir, "events.duckdb")
 	}
-	return ""
+	exePath, err := os.Executable()
+	if err != nil {
+		return filepath.Join("data", "events.duckdb")
+	}
+	return filepath.Join(filepath.Dir(exePath), "data", "events.duckdb")
 }
 
 // DuckDBStore persists DML statements to an embedded DuckDB database.
 type DuckDBStore struct {
-	db    *sql.DB
-	mu    sync.Mutex
-	tx    *sql.Tx
-	stmt  *sql.Stmt
-	count int
+	db     *sql.DB
+	mu     sync.Mutex
+	tx     *sql.Tx
+	stmt   *sql.Stmt
+	del    *sql.Stmt
+	delTxn *sql.Stmt
+	count  int
 
 	// pendingCheckpoints holds db_name→lsn pairs to be persisted on the next
 	// commitBatch call. Written by SaveCheckpoint, flushed by flushCheckpoints.
@@ -196,6 +202,27 @@ func (s *DuckDBStore) setupSchema() error {
 
 	// Migration: add commit_time column if missing (existing databases).
 	s.db.Exec(`ALTER TABLE log_events ADD COLUMN IF NOT EXISTS commit_time TIMESTAMP`)
+	s.db.Exec(`ALTER TABLE log_events ADD COLUMN IF NOT EXISTS status VARCHAR`)
+	s.db.Exec(`ALTER TABLE log_events ADD COLUMN IF NOT EXISTS confidence VARCHAR`)
+	s.db.Exec(`ALTER TABLE log_events ADD COLUMN IF NOT EXISTS compression_type VARCHAR`)
+	s.db.Exec(`ALTER TABLE log_events ADD COLUMN IF NOT EXISTS compressed_row_hex VARCHAR`)
+	s.db.Exec(`ALTER TABLE log_events ADD COLUMN IF NOT EXISTS decompressed_debug_json JSON`)
+	s.db.Exec(`ALTER TABLE log_events ADD COLUMN IF NOT EXISTS compression_decode_status VARCHAR`)
+
+	// Remove physical tombstone records written by older versions. These compact
+	// 15-byte DELETE payloads are SQL Server cleanup metadata, not row images.
+	if _, err := s.db.Exec(`
+		DELETE FROM log_events
+		WHERE operation = 'DELETE'
+		  AND compression_decode_status = 'compressed_row_parse_failed'
+		  AND length(compressed_row_hex) = 30
+		  AND lower(substr(compressed_row_hex, 1, 18)) IN (
+		      '070000000000000000',
+		      '4e0000000000000000'
+		  )
+	`); err != nil {
+		return fmt.Errorf("cleanup tombstone migration: %w", err)
+	}
 
 	// Migration: ensure UNIQUE(db_name, lsn) to prevent duplicates on restart.
 	// Step 1: remove any existing duplicates (idempotent — no-op when table is clean).
@@ -230,20 +257,41 @@ func (s *DuckDBStore) beginBatch() error {
 	if err != nil {
 		return err
 	}
-	// ON CONFLICT (db_name, lsn) DO NOTHING: silently skips rows that already exist.
-	// This is the second line of defence against duplicates; the primary defence is
-	// the LSN checkpoint in scanDatabase / pollLDF.
-	stmt, err := tx.Prepare(`INSERT INTO log_events
-		(lsn, txn_id, operation, db_name, schema_name, table_name, sql_stmt, rollback_sql, event_time, commit_time)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT (db_name, lsn) DO NOTHING`)
+	// Re-scans must refresh previously decoded rows. Decoder fixes and refreshed
+	// schema metadata can change SQL for the same immutable source LSN.
+	del, err := tx.Prepare(`DELETE FROM log_events WHERE db_name = ? AND lsn = ?`)
 	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	delTxn, err := tx.Prepare(`DELETE FROM log_events WHERE db_name = ? AND txn_id = ?`)
+	if err != nil {
+		del.Close()
+		tx.Rollback()
+		return err
+	}
+	stmt, err := tx.Prepare(`INSERT INTO log_events
+		(lsn, txn_id, operation, db_name, schema_name, table_name, sql_stmt, rollback_sql, event_time, commit_time,
+		 status, confidence, compression_type, compressed_row_hex, decompressed_debug_json, compression_decode_status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		delTxn.Close()
+		del.Close()
 		tx.Rollback()
 		return err
 	}
 	s.tx = tx
 	s.stmt = stmt
+	s.del = del
+	s.delTxn = delTxn
 	return nil
+}
+
+func nullIfEmpty(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // splitSchemaTable splits "[dbo].[Orders]" or "dbo.Orders" → ("dbo", "Orders").
@@ -258,6 +306,9 @@ func splitSchemaTable(full string) (schemaName, tableName string) {
 
 // Write buffers a statement; commits automatically every batchSize records.
 func (s *DuckDBStore) Write(st *dml.Statement) error {
+	if isPhysicalCleanupStatement(st) {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	schName, tblName := splitSchemaTable(st.Table)
@@ -268,11 +319,93 @@ func (s *DuckDBStore) Write(st *dml.Statement) error {
 	if !st.CommitTime.IsZero() {
 		commitTime = st.CommitTime.UTC().Format(time.RFC3339Nano)
 	}
+	var debugJSON interface{}
+	if st.DecompressedDebugJSON != "" {
+		debugJSON = st.DecompressedDebugJSON
+	}
+	if _, err := s.del.Exec(st.Database, st.LSN); err != nil {
+		s.restartBatch()
+		return err
+	}
 	if _, err := s.stmt.Exec(
 		st.LSN, st.TransactionID, st.Operation,
 		st.Database, schName, tblName,
 		st.SQL, st.RollbackSQL, eventTime, commitTime,
+		nullIfEmpty(st.Status), nullIfEmpty(st.Confidence), nullIfEmpty(st.CompressionType),
+		nullIfEmpty(st.CompressedRowHex), debugJSON, nullIfEmpty(st.CompressionDecodeStatus),
 	); err != nil {
+		s.restartBatch()
+		return err
+	}
+	s.count++
+	if s.count >= duckBatchSize {
+		return s.commitBatch()
+	}
+	return nil
+}
+
+// DeleteLSN removes a previously persisted event when a newer decoder version
+// determines that the source record is not a base-table DML event.
+func (s *DuckDBStore) DeleteLSN(dbName, lsn string) error {
+	if dbName == "" || lsn == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.del.Exec(dbName, lsn); err != nil {
+		s.restartBatch()
+		return err
+	}
+	s.count++
+	if s.count >= duckBatchSize {
+		return s.commitBatch()
+	}
+	return nil
+}
+
+func (s *DuckDBStore) restartBatch() {
+	if s.stmt != nil {
+		s.stmt.Close()
+	}
+	if s.del != nil {
+		s.del.Close()
+	}
+	if s.delTxn != nil {
+		s.delTxn.Close()
+	}
+	if s.tx != nil {
+		s.tx.Rollback()
+	}
+	s.count = 0
+	if err := s.beginBatch(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: restart duckdb batch: %v\n", err)
+	}
+}
+
+func isPhysicalCleanupStatement(st *dml.Statement) bool {
+	if st == nil ||
+		st.Operation != "DELETE" ||
+		st.CompressionDecodeStatus != "compressed_row_parse_failed" {
+		return false
+	}
+	rowHex := strings.ToLower(st.CompressedRowHex)
+	if len(rowHex) != 30 {
+		return false
+	}
+	return strings.HasPrefix(rowHex, "070000000000000000") ||
+		strings.HasPrefix(rowHex, "4e0000000000000000")
+}
+
+// DeleteTransaction removes all persisted events for one source transaction.
+// Historical rescans use this to clean up rows produced by older decoder
+// versions before an internal SQL Server maintenance transaction was excluded.
+func (s *DuckDBStore) DeleteTransaction(dbName, txnID string) error {
+	if dbName == "" || txnID == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.delTxn.Exec(dbName, txnID); err != nil {
 		return err
 	}
 	s.count++
@@ -311,6 +444,8 @@ func (s *DuckDBStore) LoadAllCheckpoints() (map[string]string, error) {
 
 func (s *DuckDBStore) commitBatch() error {
 	s.stmt.Close()
+	s.del.Close()
+	s.delTxn.Close()
 	if err := s.tx.Commit(); err != nil {
 		return err
 	}
@@ -369,6 +504,14 @@ func (s *DuckDBStore) Reset() error {
 		s.stmt.Close()
 		s.stmt = nil
 	}
+	if s.del != nil {
+		s.del.Close()
+		s.del = nil
+	}
+	if s.delTxn != nil {
+		s.delTxn.Close()
+		s.delTxn = nil
+	}
 	if s.tx != nil {
 		s.tx.Rollback()
 		s.tx = nil
@@ -388,6 +531,12 @@ func (s *DuckDBStore) Close() error {
 	}
 	if s.stmt != nil {
 		s.stmt.Close()
+	}
+	if s.del != nil {
+		s.del.Close()
+	}
+	if s.delTxn != nil {
+		s.delTxn.Close()
 	}
 	return s.db.Close()
 }

@@ -233,6 +233,60 @@ type ModifyRowDelta struct {
 	After     []*Value // after-values of columns in the changed region
 }
 
+// DecodeModifyRowFragment decodes before/after column values for a LOP_MODIFY_ROW
+// in-place update using [Offset in Row] fetched directly from fn_dblog.
+//
+// c0 = Contents0 (old bytes — what was overwritten).
+// c1 = Contents1 (new bytes — what replaced the old data).
+// offsetInRow = [Offset in Row] value from fn_dblog — byte position within the
+// full row where the modification starts (absolute from row start).
+//
+// Returns (before, after) slices indexed by t.Columns; nil = column not in the
+// changed region. Variable-length columns are always nil — their positions shift
+// with the delta and a full row image is needed to decode them.
+func DecodeModifyRowFragment(c0, c1 []byte, offsetInRow int, t *schema.Table) (before, after []*Value) {
+	before = make([]*Value, len(t.Columns))
+	after = make([]*Value, len(t.Columns))
+
+	c0l, c1l := len(c0), len(c1)
+
+	for i, col := range t.Columns {
+		if !col.IsFixed {
+			continue
+		}
+
+		if col.TypeID == schema.TypeBit {
+			bytePos := 4 + col.BitByteOffset
+			rel := bytePos - offsetInRow
+			if rel >= 0 && rel < c0l {
+				b := (c0[rel] >> uint(col.BitOffset)) & 1
+				before[i] = &Value{Raw: b == 1}
+			}
+			if rel >= 0 && rel < c1l {
+				b := (c1[rel] >> uint(col.BitOffset)) & 1
+				after[i] = &Value{Raw: b == 1}
+			}
+			continue
+		}
+
+		colStart := 4 + col.FixedOffset
+		size := schema.FixedSize(col)
+		rel := colStart - offsetInRow
+
+		if rel >= 0 && rel+size <= c0l {
+			if raw, err := decodeFixed(col, c0[rel:rel+size]); err == nil {
+				before[i] = &Value{Raw: raw}
+			}
+		}
+		if rel >= 0 && rel+size <= c1l {
+			if raw, err := decodeFixed(col, c1[rel:rel+size]); err == nil {
+				after[i] = &Value{Raw: raw}
+			}
+		}
+	}
+	return
+}
+
 // ParseModifyRowDelta extracts before/after values for fixed-length columns
 // from a LOP_MODIFY_ROW log record binary (the [Log Record] column in fn_dblog).
 //
@@ -383,11 +437,11 @@ func decodeFixed(col *schema.Column, b []byte) (interface{}, error) {
 		return formatMoneyScaled((hi << 32) | lo), nil
 
 	case schema.TypeDatetime:
-		days := int32(binary.LittleEndian.Uint32(b[0:4]))
-		ticks := binary.LittleEndian.Uint32(b[4:8]) // 1/300 seconds since midnight
+		ticks := binary.LittleEndian.Uint32(b[0:4]) // 1/300 seconds since midnight
+		days := int32(binary.LittleEndian.Uint32(b[4:8]))
 		base := time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC)
 		t := base.AddDate(0, 0, int(days))
-		ns := int64(ticks) * int64(time.Second) * 10 / 3 // 1/300 s = 10/3 ms ≈ 3333333 ns
+		ns := int64(ticks) * int64(time.Second) / 300
 		t = t.Add(time.Duration(ns))
 		return t, nil
 

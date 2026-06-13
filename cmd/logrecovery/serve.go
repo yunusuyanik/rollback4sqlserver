@@ -21,6 +21,7 @@ import (
 
 	"github.com/uns/mssqllogrecovery/internal/dml"
 	"github.com/uns/mssqllogrecovery/internal/logparser"
+	"github.com/uns/mssqllogrecovery/internal/mssql"
 	"github.com/uns/mssqllogrecovery/internal/schema"
 	"github.com/uns/mssqllogrecovery/internal/store"
 )
@@ -118,30 +119,26 @@ func shortLSN(lsn string) string {
 	return a + ":" + b
 }
 
-func runServe(httpPort int, host, user, pass string, sqlPort int, dbName string, allDBs bool, sinceTime time.Time) error {
+func runServe(httpPort int, host, user, pass string, sqlPort int, dbName string, allDBs bool, sinceTime time.Time, dataDir string) error {
 	bgCtx, bgCancel = context.WithCancel(context.Background())
 
-	dbPath := store.PersistentDBPath()
+	dbPath := store.ResolveDBPath(dataDir)
 	var err error
 	appStore, err = store.OpenDuckDB(dbPath)
 	if err != nil {
 		return fmt.Errorf("init store: %w", err)
 	}
-	if dbPath != "" {
-		logf("persistent store: %s", dbPath)
-		appStore.StartTTLWorker(bgCtx)
-		if cps, err2 := appStore.LoadAllCheckpoints(); err2 == nil {
-			checkpointMu.Lock()
-			for db, lsn := range cps {
-				ldfCheckpoint[db] = lsn
-			}
-			checkpointMu.Unlock()
-			if len(cps) > 0 {
-				logf("restored %d checkpoint(s) — incremental scan will resume", len(cps))
-			}
+	logf("persistent store: %s", dbPath)
+	appStore.StartTTLWorker(bgCtx)
+	if cps, err2 := appStore.LoadAllCheckpoints(); err2 == nil {
+		checkpointMu.Lock()
+		for db, lsn := range cps {
+			ldfCheckpoint[db] = lsn
 		}
-	} else {
-		logf("store: in-memory (set AGENT_DB_PATH for persistence)")
+		checkpointMu.Unlock()
+		if len(cps) > 0 {
+			logf("restored %d checkpoint(s) — incremental scan will resume", len(cps))
+		}
 	}
 
 	if host != "" {
@@ -173,8 +170,10 @@ func runServe(httpPort int, host, user, pass string, sqlPort int, dbName string,
 // poller across poll cycles. A transaction whose data records arrive in cycle N
 // and whose COMMIT arrives in cycle N+1 is correctly flushed thanks to this state.
 type dbPollState struct {
-	pending    map[string][]*dml.Statement
-	beginTimes map[string]time.Time
+	pending       map[string][]*dml.Statement
+	beginTimes    map[string]time.Time
+	excluded      map[string]bool
+	schemaVersion string
 }
 
 func getPollState(dbName string) *dbPollState {
@@ -186,6 +185,7 @@ func getPollState(dbName string) *dbPollState {
 	s := &dbPollState{
 		pending:    make(map[string][]*dml.Statement),
 		beginTimes: make(map[string]time.Time),
+		excluded:   make(map[string]bool),
 	}
 	pollStateByDB[dbName] = s
 	return s
@@ -199,6 +199,7 @@ func pruneStalePollState(state *dbPollState) {
 		if !bt.IsZero() && bt.Before(cutoff) {
 			delete(state.pending, txnID)
 			delete(state.beginTimes, txnID)
+			delete(state.excluded, txnID)
 		}
 	}
 }
@@ -308,22 +309,24 @@ func scanDatabase(ctx context.Context, server, user, pass, dbName string, sinceT
 	appMu.Lock()
 	appSchemas[dbName] = sch
 	appMu.Unlock()
+	if version, versionErr := readSchemaVersion(srcDB); versionErr == nil {
+		getPollState(dbName).schemaVersion = version
+	}
 
 	appMu.RLock()
 	st := appStore
 	appMu.RUnlock()
 
-	// If a checkpoint exists (loaded from DB at startup), resume from that LSN.
-	// This prevents re-reading the full sinceTime window on restart.
+	// A requested history window must always be re-read from the active log.
+	// Checkpoints are only an optimization for unbounded incremental scans;
+	// using one here would skip transactions that are inside sinceTime but
+	// older than the last poller's checkpoint.
 	checkpointMu.RLock()
 	resumeLSN := ldfCheckpoint[dbName]
 	checkpointMu.RUnlock()
-
-	// When resuming, the LSN bound is more precise than sinceTime — disable the
-	// time filter so in-flight transactions at the boundary are not silently dropped.
 	effectiveSince := sinceTime
-	if resumeLSN != "" {
-		effectiveSince = time.Time{}
+	if !sinceTime.IsZero() {
+		resumeLSN = ""
 	}
 
 	if resumeLSN != "" {
@@ -332,10 +335,14 @@ func scanDatabase(ctx context.Context, server, user, pass, dbName string, sinceT
 		logf("[%s] starting initial scan", dbName)
 	}
 
-	gen := dml.New(sch)
+	gen := dml.NewWithPageReader(sch, mssql.NewSQLPageReader(srcDB, dbName))
 	pending := make(map[string][]*dml.Statement)
 	beginTimes := make(map[string]time.Time)
+	excluded := make(map[string]bool)
+	seenLSNs := make(map[string]struct{})
 	var firstLSN, maxLSN string
+	var beginCount, dataCount, commitCount, generatedCount, generateErrorCount int64
+	var eligibleContextCount, resolvedTableCount int64
 
 	progMu.RLock()
 	snapIns, snapUpd, snapDel, snapTotal := progress.Inserts, progress.Updates, progress.Deletes, progress.Total
@@ -350,13 +357,43 @@ func scanDatabase(ctx context.Context, server, user, pass, dbName string, sinceT
 			return context.Canceled
 		default:
 		}
+		if _, seen := seenLSNs[rec.LSN]; seen {
+			return nil
+		}
+		seenLSNs[rec.LSN] = struct{}{}
 		if firstLSN == "" {
 			firstLSN = rec.LSN
 		}
 		if rec.LSN > maxLSN {
 			maxLSN = rec.LSN
 		}
-		err := handleScanRecord(rec, gen, dbName, effectiveSince, st, pending, beginTimes, true, func(string) bool { return true })
+		switch rec.Operation {
+		case logparser.OpBeginXact:
+			beginCount++
+		case logparser.OpCommitXact:
+			commitCount++
+		case logparser.OpInsertRows, logparser.OpDeleteRows, logparser.OpModifyRow, logparser.OpModifyColumns:
+			dataCount++
+			if rec.Context == "LCX_HEAP" || rec.Context == "LCX_CLUSTERED" || rec.Context == "LCX_MARK_AS_GHOST" {
+				eligibleContextCount++
+				if sch.LookupStorage(rec.AllocUnitName, rec.AllocUnitID, rec.PartitionID) != nil {
+					resolvedTableCount++
+				}
+			}
+		}
+		beforePending := pendingStatementCount(pending)
+		err := handleScanRecord(rec, gen, dbName, effectiveSince, st, pending, beginTimes, excluded, true, func(string) bool { return true })
+		afterPending := pendingStatementCount(pending)
+		if afterPending > beforePending {
+			generatedCount += int64(afterPending - beforePending)
+		}
+		if err != nil {
+			generateErrorCount++
+			if generateErrorCount <= 10 {
+				logf("[%s] decode error: %v", dbName, err)
+			}
+			return nil
+		}
 		if time.Since(lastLog) >= time.Second {
 			progMu.RLock()
 			tot := progress.Total
@@ -368,7 +405,23 @@ func scanDatabase(ctx context.Context, server, user, pass, dbName string, sinceT
 				lastLoggedTotal = tot
 			}
 		}
-		return err
+		return nil
+	}
+
+	if !sinceTime.IsZero() {
+		files, backupErr := historicalLogBackupFiles(ctx, srcDB, dbName, sinceTime)
+		switch {
+		case backupErr != nil:
+			logf("[%s] historical TRN discovery skipped: %v", dbName, backupErr)
+		case len(files) == 0:
+			logf("[%s] no accessible TRN backups found since %s; history before active LDF is unavailable",
+				dbName, sinceTime.Format("2006-01-02 15:04:05"))
+		default:
+			logf("[%s] historical scan: reading %d TRN backup file(s)", dbName, len(files))
+			if err := logparser.NewTRNReader(srcDB, files).Read(scanOps(), handler); err != nil && err != context.Canceled {
+				logf("[%s] historical TRN scan failed: %v", dbName, err)
+			}
+		}
 	}
 
 	r := logparser.NewLDFReader(srcDB)
@@ -397,7 +450,84 @@ func scanDatabase(ctx context.Context, server, user, pass, dbName string, sinceT
 	logf("[%s] imported %s (ins:%s upd:%s del:%s) · %d errors · LSN %s→%s",
 		dbName, fmtN(deltaTotal), fmtN(deltaIns), fmtN(deltaUpd), fmtN(deltaDel),
 		deltaErrs, shortLSN(firstLSN), shortLSN(maxLSN))
+	logf("[%s] scan detail: begin=%d data=%d eligible_context=%d resolved_table=%d commit=%d generated=%d pending=%d generator_errors=%d",
+		dbName, beginCount, dataCount, eligibleContextCount, resolvedTableCount, commitCount, generatedCount,
+		pendingStatementCount(pending), generateErrorCount)
 	return nil
+}
+
+func pendingStatementCount(pending map[string][]*dml.Statement) int {
+	total := 0
+	for _, statements := range pending {
+		total += len(statements)
+	}
+	return total
+}
+
+// historicalLogBackupFiles returns SQL Server-side TRN paths whose backup time
+// overlaps the requested history window. One immediately preceding backup is
+// included so transactions that began before the boundary but committed inside
+// it still have their BEGIN and row records available.
+func historicalLogBackupFiles(
+	ctx context.Context,
+	srcDB *sql.DB,
+	dbName string,
+	sinceTime time.Time,
+) ([]string, error) {
+	rows, err := srcDB.QueryContext(ctx, `
+		WITH selected_backups AS (
+			SELECT TOP (512)
+				bs.backup_set_id,
+				bs.backup_start_date
+			FROM msdb.dbo.backupset bs
+			WHERE bs.database_name = @db
+			  AND bs.type = 'L'
+			  AND bs.backup_finish_date >= @since
+			ORDER BY bs.backup_start_date
+		),
+		previous_backup AS (
+			SELECT TOP (1)
+				bs.backup_set_id,
+				bs.backup_start_date
+			FROM msdb.dbo.backupset bs
+			WHERE bs.database_name = @db
+			  AND bs.type = 'L'
+			  AND bs.backup_finish_date < @since
+			ORDER BY bs.backup_finish_date DESC
+		),
+		wanted AS (
+			SELECT * FROM previous_backup
+			UNION
+			SELECT * FROM selected_backups
+		)
+		SELECT bmf.physical_device_name
+		FROM wanted w
+		JOIN msdb.dbo.backupset bs
+		  ON bs.backup_set_id = w.backup_set_id
+		JOIN msdb.dbo.backupmediafamily bmf
+		  ON bmf.media_set_id = bs.media_set_id
+		ORDER BY w.backup_start_date, bmf.family_sequence_number`,
+		sql.Named("db", dbName),
+		sql.Named("since", sinceTime),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("msdb log backup query: %w", err)
+	}
+	defer rows.Close()
+
+	var files []string
+	seen := make(map[string]bool)
+	for rows.Next() {
+		var path sql.NullString
+		if err := rows.Scan(&path); err != nil {
+			return nil, err
+		}
+		if path.Valid && path.String != "" && !seen[path.String] {
+			files = append(files, path.String)
+			seen[path.String] = true
+		}
+	}
+	return files, rows.Err()
 }
 
 // startLDFPoller polls fn_dblog every 5 s, storing committed changes since last LSN.
@@ -449,6 +579,9 @@ func startLDFPoller(ctx context.Context, server, user, pass, dbName string) {
 				logf("[%s] +%s imported (ins:%s upd:%s del:%s) · %d errors · LSN %s→%s",
 					dbName, fmtN(delta), fmtN(deltaIns), fmtN(deltaUpd), fmtN(deltaDel),
 					errDelta, shortLSN(lsnBefore), shortLSN(lsnAfter))
+			} else {
+				logf("[%s] poll scanned LSN %s→%s · 0 events · %d errors",
+					dbName, shortLSN(lsnBefore), shortLSN(lsnAfter), errDelta)
 			}
 		}
 	}
@@ -461,6 +594,11 @@ func pollLDF(ctx context.Context, server, user, pass, dbName string) error {
 	}
 	defer srcDB.Close()
 
+	// Use persistent state so transactions whose data records arrive in this
+	// cycle but whose COMMIT arrives in the next cycle are not lost.
+	state := getPollState(dbName)
+	pruneStalePollState(state)
+
 	appMu.RLock()
 	sch := appSchemas[dbName]
 	st := appStore
@@ -469,18 +607,30 @@ func pollLDF(ctx context.Context, server, user, pass, dbName string) error {
 		return nil
 	}
 
+	if version, versionErr := readSchemaVersion(srcDB); versionErr == nil &&
+		(state.schemaVersion == "" || version != state.schemaVersion) {
+		refreshed, refreshErr := schema.Extract(srcDB)
+		if refreshErr != nil {
+			return fmt.Errorf("refresh schema: %w", refreshErr)
+		}
+		oldCount := len(sch.Tables)
+		sch = refreshed
+		state.schemaVersion = version
+		appMu.Lock()
+		appSchemas[dbName] = refreshed
+		appMu.Unlock()
+		logf("[%s] schema changed: %d→%d tables; metadata refreshed",
+			dbName, oldCount, len(refreshed.Tables))
+	}
+
 	checkpointMu.RLock()
 	startLSN := ldfCheckpoint[dbName]
 	checkpointMu.RUnlock()
 
-	gen := dml.New(sch)
-
-	// Use persistent state so transactions whose data records arrive in this
-	// cycle but whose COMMIT arrives in the next cycle are not lost.
-	state := getPollState(dbName)
-	pruneStalePollState(state)
-
+	pageReader := mssql.NewSQLPageReader(srcDB, dbName)
+	gen := dml.NewWithPageReader(sch, pageReader)
 	var maxLSN string
+	refreshedUnknownStorage := false
 
 	handler := func(rec *logparser.LogRecord) error {
 		select {
@@ -491,7 +641,26 @@ func pollLDF(ctx context.Context, server, user, pass, dbName string) error {
 		if rec.LSN > maxLSN {
 			maxLSN = rec.LSN
 		}
-		return handleScanRecord(rec, gen, dbName, time.Time{}, st, state.pending, state.beginTimes, true, func(string) bool { return true })
+		if rec.IsDataOp() &&
+			sch.LookupStorage(rec.AllocUnitName, rec.AllocUnitID, rec.PartitionID) == nil &&
+			!sch.IsKnownNonBaseIndex(rec.AllocUnitName) &&
+			!refreshedUnknownStorage {
+			refreshedUnknownStorage = true
+			refreshed, refreshErr := schema.Extract(srcDB)
+			if refreshErr == nil {
+				sch = refreshed
+				gen = dml.NewWithPageReader(refreshed, pageReader)
+				appMu.Lock()
+				appSchemas[dbName] = refreshed
+				appMu.Unlock()
+				if version, versionErr := readSchemaVersion(srcDB); versionErr == nil {
+					state.schemaVersion = version
+				}
+				logf("[%s] unknown allocation %q; schema metadata refreshed",
+					dbName, rec.AllocUnitName)
+			}
+		}
+		return handleScanRecord(rec, gen, dbName, time.Time{}, st, state.pending, state.beginTimes, state.excluded, true, func(string) bool { return true })
 	}
 
 	r := logparser.NewLDFReader(srcDB)
@@ -544,6 +713,30 @@ func pollLDF(ctx context.Context, server, user, pass, dbName string) error {
 	return nil
 }
 
+// readSchemaVersion returns a cheap fingerprint for user-table metadata. Pollers
+// compare it before reading fn_dblog so newly created/altered tables are decoded
+// without restarting the process.
+func readSchemaVersion(db *sql.DB) (string, error) {
+	var version string
+	err := db.QueryRow(`
+		SELECT CONCAT(
+			(SELECT COUNT_BIG(*) FROM sys.tables), ':',
+			(SELECT COUNT_BIG(*)
+			 FROM sys.columns c
+			 JOIN sys.tables t ON t.object_id = c.object_id), ':',
+			COALESCE(CONVERT(varchar(33),
+				(SELECT MAX(modify_date) FROM sys.tables), 126), ''), ':',
+			COALESCE(CONVERT(varchar(30),
+				(SELECT CHECKSUM_AGG(BINARY_CHECKSUM(
+					p.object_id, p.partition_id, p.data_compression))
+				 FROM sys.partitions p
+				 JOIN sys.tables t ON t.object_id = p.object_id
+				 WHERE p.index_id IN (0, 1))), '0')
+		)
+	`).Scan(&version)
+	return version, err
+}
+
 // handleScanRecord processes one log record in the committed-transaction pipeline.
 // sinceTime.IsZero() = no time filter.
 func handleScanRecord(
@@ -554,15 +747,29 @@ func handleScanRecord(
 	st *store.DuckDBStore,
 	pending map[string][]*dml.Statement,
 	beginTimes map[string]time.Time,
+	excluded map[string]bool,
 	committedOnly bool,
 	allowed func(string) bool,
 ) error {
 	switch rec.Operation {
 	case logparser.OpBeginXact:
 		beginTimes[rec.TransactionID] = parseLogTime(rec.BeginTime)
+		if isInternalTransaction(rec.TransactionName) {
+			excluded[rec.TransactionID] = true
+			delete(pending, rec.TransactionID)
+			if st != nil {
+				return st.DeleteTransaction(dbName, rec.TransactionID)
+			}
+		}
 		return nil
 
 	case logparser.OpCommitXact:
+		if excluded[rec.TransactionID] {
+			delete(pending, rec.TransactionID)
+			delete(beginTimes, rec.TransactionID)
+			delete(excluded, rec.TransactionID)
+			return nil
+		}
 		bt := beginTimes[rec.TransactionID]
 		commitTime := parseLogTime(rec.EndTime)
 		if bt.IsZero() {
@@ -571,6 +778,7 @@ func handleScanRecord(
 		if !sinceTime.IsZero() && !bt.IsZero() && bt.Before(sinceTime) {
 			delete(pending, rec.TransactionID)
 			delete(beginTimes, rec.TransactionID)
+			delete(excluded, rec.TransactionID)
 			return nil
 		}
 		for _, stmt := range pending[rec.TransactionID] {
@@ -581,16 +789,36 @@ func handleScanRecord(
 		}
 		delete(pending, rec.TransactionID)
 		delete(beginTimes, rec.TransactionID)
+		delete(excluded, rec.TransactionID)
 		return nil
 
 	case logparser.OpAbortXact:
 		delete(pending, rec.TransactionID)
 		delete(beginTimes, rec.TransactionID)
+		delete(excluded, rec.TransactionID)
+		return nil
+	}
+
+	if excluded[rec.TransactionID] {
+		return nil
+	}
+	if isPhysicalCleanupDelete(rec) {
+		excluded[rec.TransactionID] = true
+		delete(pending, rec.TransactionID)
+		if st != nil {
+			return st.DeleteTransaction(dbName, rec.TransactionID)
+		}
 		return nil
 	}
 
 	stmt, err := gen.Generate(rec)
-	if err != nil || stmt == nil {
+	if err != nil {
+		return fmt.Errorf("generate %s %s: %w", rec.LSN, rec.Operation, err)
+	}
+	if stmt == nil {
+		if st != nil && rec.IsDataOp() {
+			return st.DeleteLSN(dbName, rec.LSN)
+		}
 		return nil
 	}
 	if committedOnly {
@@ -601,6 +829,43 @@ func handleScanRecord(
 	stmt.Timestamp = beginTimes[rec.TransactionID]
 	writeToStore(st, stmt, allowed)
 	return nil
+}
+
+func isInternalTransaction(name string) bool {
+	name = strings.TrimSpace(name)
+	switch name {
+	case "ShrinkFile",
+		"AllocHeapPageSimpleXactDML",
+		"AllocFirstPage",
+		"QDS base transaction",
+		"QDS nested transaction":
+		return true
+	}
+	return strings.HasPrefix(name, "Backup:")
+}
+
+// isPhysicalCleanupDelete recognizes the compact tombstone records emitted
+// after SQL Server has already logged the logical heap DELETE. They are not row
+// images and therefore must not be decoded or exposed as another user DELETE.
+//
+// Observed layout:
+//
+//	byte 0     internal cleanup marker (0x07 PAGE, 0x4E ROW)
+//	bytes 1-8  zero
+//	bytes 9-14 owning transaction tail
+func isPhysicalCleanupDelete(rec *logparser.LogRecord) bool {
+	if rec.Operation != logparser.OpDeleteRows || len(rec.Contents0) != 15 {
+		return false
+	}
+	if rec.Contents0[0] != 0x07 && rec.Contents0[0] != 0x4E {
+		return false
+	}
+	for _, b := range rec.Contents0[1:9] {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func scanOps() []string {
@@ -722,9 +987,11 @@ func buildMux() http.Handler {
 	mux.HandleFunc("/api/progress", handleProgress)
 
 	// Log data
-	mux.HandleFunc("/api/logs", handleLogs)       // timeline — primary endpoint
-	mux.HandleFunc("/api/search", handleSearch)   // time-range filtered search
-	mux.HandleFunc("/api/events", handleEvents)   // legacy compat
+	mux.HandleFunc("/api/logs", handleLogs)         // event feed — primary endpoint
+	mux.HandleFunc("/api/timeline", handleTimeline) // timeline — server-side bucket counts
+	mux.HandleFunc("/api/search", handleSearch) // time-range filtered search
+	mux.HandleFunc("/api/events", handleEvents) // legacy compat
+	mux.HandleFunc("/api/diagnostics", handleDiagnostics)
 	mux.HandleFunc("/api/stats", handleStats)
 	mux.HandleFunc("/api/export", handleExport)
 
@@ -734,6 +1001,59 @@ func buildMux() http.Handler {
 	mux.HandleFunc("/api/reload-schema", handleReloadSchema)
 
 	return corsMiddleware(mux)
+}
+
+// GET /api/diagnostics?db=MyDB&table=EventSource&limit=20
+// Returns the newest non-ok decoder events with their captured raw log fields.
+func handleDiagnostics(w http.ResponseWriter, r *http.Request) {
+	appMu.RLock()
+	s := appStore
+	appMu.RUnlock()
+	if s == nil {
+		writeJSON(w, map[string]interface{}{"total": 0, "events": []struct{}{}})
+		return
+	}
+
+	q := r.URL.Query()
+	limit := queryInt(q.Get("limit"), 20)
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 200 {
+		limit = 200
+	}
+
+	where := ` WHERE status IS NOT NULL AND status <> 'ok'`
+	var args []interface{}
+	if dbName := strings.TrimSpace(q.Get("db")); dbName != "" {
+		where += ` AND db_name = ?`
+		args = append(args, dbName)
+	}
+	if schemaName := strings.TrimSpace(q.Get("schema")); schemaName != "" {
+		where += ` AND schema_name = ?`
+		args = append(args, schemaName)
+	}
+	if tableName := strings.TrimSpace(q.Get("table")); tableName != "" {
+		where += ` AND table_name = ?`
+		args = append(args, tableName)
+	}
+
+	var total int
+	s.DB().QueryRow(`SELECT count(*) FROM log_events`+where, args...).Scan(&total)
+	rows, err := s.DB().Query(
+		eventSelectColumns+where+
+			fmt.Sprintf(` ORDER BY event_time DESC NULLS LAST, id DESC LIMIT %d`, limit),
+		args...,
+	)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	defer rows.Close()
+	writeJSON(w, map[string]interface{}{
+		"total":  total,
+		"events": scanEventRows(rows),
+	})
 }
 
 // ── Connection + session handlers ─────────────────────────────────────────────
@@ -937,7 +1257,7 @@ func handleLogs(w http.ResponseWriter, r *http.Request) {
 
 	orderBy := buildOrderBy(q.Get("sort"), q.Get("dir"))
 	rows, err := conn.Query(
-		"SELECT lsn, txn_id, operation, db_name, schema_name, table_name, sql_stmt, rollback_sql, event_time, commit_time FROM log_events"+
+		eventSelectColumns+
 			where+orderBy+fmt.Sprintf(" LIMIT %d OFFSET %d", limit, off),
 		args...)
 	if err != nil {
@@ -948,6 +1268,91 @@ func handleLogs(w http.ResponseWriter, r *http.Request) {
 
 	events := scanEventRows(rows)
 	writeJSON(w, map[string]interface{}{"total": total, "page": page, "limit": limit, "events": events})
+}
+
+// GET /api/timeline?since=...&until=...&buckets=72&db=&table=&op=&search=
+// Returns per-bucket INSERT/UPDATE/DELETE counts aggregated server-side with
+// GROUP BY — counts ALL matching events (no row limit), unlike /api/logs.
+func handleTimeline(w http.ResponseWriter, r *http.Request) {
+	appMu.RLock()
+	s := appStore
+	appMu.RUnlock()
+	if s == nil {
+		writeJSON(w, map[string]interface{}{"buckets": 0, "data": []struct{}{}})
+		return
+	}
+
+	q := r.URL.Query()
+	buckets := queryInt(q.Get("buckets"), 72)
+	if buckets < 1 || buckets > 2000 {
+		buckets = 72
+	}
+	since, err1 := time.Parse(time.RFC3339, q.Get("since"))
+	until, err2 := time.Parse(time.RFC3339, q.Get("until"))
+	if err1 != nil || err2 != nil || !until.After(since) {
+		http.Error(w, "since/until must be valid RFC3339 with until>since", http.StatusBadRequest)
+		return
+	}
+	sinceMs := since.UnixMilli()
+	untilMs := until.UnixMilli()
+	bucketMs := (untilMs - sinceMs) / int64(buckets)
+	if bucketMs < 1 {
+		bucketMs = 1
+	}
+
+	// Reuse the shared filter builder (db/table/op/search + since/until window).
+	where, args := buildWhere(q.Get("op"), q.Get("db"), q.Get("schema"), q.Get("table"),
+		q.Get("search"), since.UTC().Format(time.RFC3339), until.UTC().Format(time.RFC3339))
+	conn := s.DB()
+
+	// sinceMs/bucketMs are integers derived from parsed timestamps — safe to inline.
+	sql := fmt.Sprintf(
+		`SELECT CAST(floor((epoch_ms(event_time) - %d) / %d) AS BIGINT) AS b,
+		        operation, count(*) AS c
+		 FROM log_events%s
+		 GROUP BY b, operation`,
+		sinceMs, bucketMs, where)
+	rows, err := conn.Query(sql, args...)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	defer rows.Close()
+
+	type bucket struct {
+		Insert int `json:"insert"`
+		Update int `json:"update"`
+		Delete int `json:"delete"`
+		Total  int `json:"total"`
+	}
+	data := make([]bucket, buckets)
+	for rows.Next() {
+		var b int64
+		var op string
+		var c int
+		if err := rows.Scan(&b, &op, &c); err != nil {
+			continue
+		}
+		if b < 0 || b >= int64(buckets) {
+			continue
+		}
+		switch op {
+		case "INSERT":
+			data[b].Insert += c
+		case "UPDATE":
+			data[b].Update += c
+		case "DELETE":
+			data[b].Delete += c
+		}
+		data[b].Total += c
+	}
+	writeJSON(w, map[string]interface{}{
+		"since":     sinceMs,
+		"until":     untilMs,
+		"bucket_ms": bucketMs,
+		"buckets":   buckets,
+		"data":      data,
+	})
 }
 
 // GET /api/search?db=MyDB&table=Orders&schema=dbo&op=DELETE&from=...&to=...&q=text&limit=100&offset=0
@@ -974,7 +1379,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 	conn.QueryRow("SELECT count(*) FROM log_events"+where, args...).Scan(&total)
 
 	rows, err := conn.Query(
-		"SELECT lsn, txn_id, operation, db_name, schema_name, table_name, sql_stmt, rollback_sql, event_time, commit_time FROM log_events"+
+		eventSelectColumns+
 			where+fmt.Sprintf(" ORDER BY event_time DESC NULLS LAST, id DESC LIMIT %d OFFSET %d", limit, off),
 		args...)
 	if err != nil {
@@ -1008,7 +1413,7 @@ func handleEvents(w http.ResponseWriter, r *http.Request) {
 	conn.QueryRow("SELECT count(*) FROM log_events"+where, args...).Scan(&total)
 
 	rows, err := conn.Query(
-		"SELECT lsn, txn_id, operation, db_name, schema_name, table_name, sql_stmt, rollback_sql, event_time, commit_time FROM log_events"+
+		eventSelectColumns+
 			where+fmt.Sprintf(" ORDER BY id LIMIT %d OFFSET %d", limit, off),
 		args...)
 	if err != nil {
@@ -1022,24 +1427,38 @@ func handleEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 type logEvent struct {
-	LSN         string  `json:"lsn"`
-	TxnID       string  `json:"txn_id"`
-	Operation   string  `json:"operation"`
-	Database    string  `json:"db_name"`
-	SchemaName  string  `json:"schema_name"`
-	Table       string  `json:"table_name"`
-	SQL         string  `json:"sql_stmt"`
-	RollbackSQL string  `json:"rollback_sql,omitempty"`
-	EventTime   *string `json:"event_time,omitempty"`  // transaction begin time
-	CommitTime  *string `json:"commit_time,omitempty"` // transaction commit time
+	LSN                     string          `json:"lsn"`
+	TxnID                   string          `json:"txn_id"`
+	Operation               string          `json:"operation"`
+	Database                string          `json:"db_name"`
+	SchemaName              string          `json:"schema_name"`
+	Table                   string          `json:"table_name"`
+	SQL                     string          `json:"sql_stmt"`
+	RollbackSQL             string          `json:"rollback_sql,omitempty"`
+	EventTime               *string         `json:"event_time,omitempty"`  // transaction begin time
+	CommitTime              *string         `json:"commit_time,omitempty"` // transaction commit time
+	Status                  string          `json:"status,omitempty"`
+	Confidence              string          `json:"confidence,omitempty"`
+	CompressionType         string          `json:"compression_type,omitempty"`
+	CompressedRowHex        string          `json:"compressed_row_hex,omitempty"`
+	DecompressedDebugJSON   json.RawMessage `json:"decompressed_debug_json,omitempty"`
+	CompressionDecodeStatus string          `json:"compression_decode_status,omitempty"`
 }
+
+const eventSelectColumns = "SELECT lsn, txn_id, operation, db_name, schema_name, table_name, sql_stmt, rollback_sql, event_time, commit_time, status, confidence, compression_type, compressed_row_hex, CAST(decompressed_debug_json AS VARCHAR), compression_decode_status FROM log_events"
 
 func scanEventRows(rows *sql.Rows) []logEvent {
 	var out []logEvent
 	for rows.Next() {
 		var e logEvent
-		var rb, ts, ct sql.NullString
-		rows.Scan(&e.LSN, &e.TxnID, &e.Operation, &e.Database, &e.SchemaName, &e.Table, &e.SQL, &rb, &ts, &ct)
+		var rb, ts, ct, status, confidence, compressionType, compressedHex, debugJSON, decodeStatus sql.NullString
+		if err := rows.Scan(
+			&e.LSN, &e.TxnID, &e.Operation, &e.Database, &e.SchemaName, &e.Table, &e.SQL,
+			&rb, &ts, &ct, &status, &confidence, &compressionType, &compressedHex, &debugJSON, &decodeStatus,
+		); err != nil {
+			logf("event row scan error: %v", err)
+			continue
+		}
 		if rb.Valid {
 			e.RollbackSQL = rb.String
 		}
@@ -1048,6 +1467,24 @@ func scanEventRows(rows *sql.Rows) []logEvent {
 		}
 		if ct.Valid && ct.String != "" {
 			e.CommitTime = &ct.String
+		}
+		if status.Valid {
+			e.Status = status.String
+		}
+		if confidence.Valid {
+			e.Confidence = confidence.String
+		}
+		if compressionType.Valid {
+			e.CompressionType = compressionType.String
+		}
+		if compressedHex.Valid {
+			e.CompressedRowHex = compressedHex.String
+		}
+		if debugJSON.Valid && json.Valid([]byte(debugJSON.String)) {
+			e.DecompressedDebugJSON = json.RawMessage(debugJSON.String)
+		}
+		if decodeStatus.Valid {
+			e.CompressionDecodeStatus = decodeStatus.String
 		}
 		out = append(out, e)
 	}
@@ -1272,7 +1709,7 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rows, err := s.DB().Query(
-		`SELECT lsn, txn_id, operation, db_name, schema_name, table_name, sql_stmt, rollback_sql, event_time, commit_time FROM log_events ORDER BY id`)
+		eventSelectColumns + ` ORDER BY id`)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -1286,8 +1723,12 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 	enc := json.NewEncoder(w)
 	for rows.Next() {
 		var lsn, txn, op, dbName, schName, tblName, sqlStr string
-		var rollbackSQL, eventTime, commitTime sql.NullString
-		rows.Scan(&lsn, &txn, &op, &dbName, &schName, &tblName, &sqlStr, &rollbackSQL, &eventTime, &commitTime)
+		var rollbackSQL, eventTime, commitTime, status, confidence, compressionType, compressedHex, debugJSON, decodeStatus sql.NullString
+		rows.Scan(
+			&lsn, &txn, &op, &dbName, &schName, &tblName, &sqlStr,
+			&rollbackSQL, &eventTime, &commitTime, &status, &confidence,
+			&compressionType, &compressedHex, &debugJSON, &decodeStatus,
+		)
 		rec := map[string]string{
 			"lsn": lsn, "txn_id": txn, "operation": op,
 			"db": dbName, "schema": schName, "table": tblName, "sql": sqlStr,
@@ -1300,6 +1741,24 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 		}
 		if commitTime.Valid {
 			rec["commit_time"] = commitTime.String
+		}
+		if status.Valid {
+			rec["status"] = status.String
+		}
+		if confidence.Valid {
+			rec["confidence"] = confidence.String
+		}
+		if compressionType.Valid {
+			rec["compression_type"] = compressionType.String
+		}
+		if compressedHex.Valid {
+			rec["compressed_row_hex"] = compressedHex.String
+		}
+		if debugJSON.Valid {
+			rec["decompressed_debug_json"] = debugJSON.String
+		}
+		if decodeStatus.Valid {
+			rec["compression_decode_status"] = decodeStatus.String
 		}
 		enc.Encode(rec)
 	}
@@ -1345,12 +1804,13 @@ func runScan(server, user, password, database, mode string, files []string, comm
 		return len(filterSet) == 0 || filterSet[strings.ToLower(name)]
 	}
 
-	gen := dml.New(sch)
+	gen := dml.NewWithPageReader(sch, mssql.NewSQLPageReader(srcDB, database))
 	pending := make(map[string][]*dml.Statement)
 	beginTimes := make(map[string]time.Time)
+	excluded := make(map[string]bool)
 
 	handler := func(rec *logparser.LogRecord) error {
-		return handleScanRecord(rec, gen, database, time.Time{}, st, pending, beginTimes, committed, tableAllowed)
+		return handleScanRecord(rec, gen, database, time.Time{}, st, pending, beginTimes, excluded, committed, tableAllowed)
 	}
 
 	var scanErr error
@@ -1718,4 +2178,3 @@ func queryInt(s string, def int) int {
 	}
 	return n
 }
-

@@ -65,16 +65,17 @@ func (r *LDFReader) Read(fn func(*LogRecord) error) error {
 // afterLSN is an exclusive lower bound (empty = read from active-log head).
 func buildLiveQuery(afterLSN string) string {
 	var sb strings.Builder
-	sb.WriteString("SELECT [Current LSN],[Operation],[Context],[Transaction ID],")
-	sb.WriteString("[AllocUnitName],[Begin time],[End time],")
+	sb.WriteString("SELECT [Current LSN],[Operation],[Context],[Transaction ID],[Transaction Name],")
+	sb.WriteString("[AllocUnitName],[AllocUnitId],[PartitionId],[Page ID],[Slot ID],[Begin time],[End time],")
 	sb.WriteString("[RowLog Contents 0],[RowLog Contents 1],[RowLog Contents 2],")
-	sb.WriteString("[RowLog Contents 3],[RowLog Contents 4],[Log Record]")
+	sb.WriteString("[RowLog Contents 3],[RowLog Contents 4],[Log Record],")
+	sb.WriteString("[Offset in Row],[Modify Size]")
 	sb.WriteString(" FROM fn_dblog(NULL,NULL)")
 	sb.WriteString(" WHERE (")
 	sb.WriteString("[Operation] IN (N'LOP_BEGIN_XACT',N'LOP_COMMIT_XACT',N'LOP_ABORT_XACT')")
 	sb.WriteString(" OR (")
 	sb.WriteString("[Operation] IN (N'LOP_INSERT_ROWS',N'LOP_DELETE_ROWS',N'LOP_MODIFY_ROW',N'LOP_MODIFY_COLUMNS')")
-	sb.WriteString(" AND [Context] IN (N'LCX_HEAP',N'LCX_CLUSTERED')")
+	sb.WriteString(" AND [Context] IN (N'LCX_HEAP',N'LCX_CLUSTERED',N'LCX_MARK_AS_GHOST')")
 	sb.WriteString(" AND ISNULL([AllocUnitName],N'') NOT LIKE N'sys.%'")
 	sb.WriteString(" AND ISNULL([AllocUnitName],N'') NOT LIKE N'Unknown Alloc Unit%'")
 	sb.WriteString("))")
