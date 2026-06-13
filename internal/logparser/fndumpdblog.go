@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	_ "github.com/microsoft/go-mssqldb"
 )
@@ -41,6 +42,18 @@ func (r *TRNReader) WithLSNRange(startLSN, endLSN string) *TRNReader {
 // If ops is empty, all records are returned.
 // The handler fn is called for each record; returning an error stops iteration.
 func (r *TRNReader) Read(ops []string, fn func(*LogRecord) error) error {
+	// A list discovered from msdb represents sequential backup sets, not striped
+	// media families. URL backups in particular must be opened one at a time;
+	// passing N files with fileCount=N tells SQL Server they are one striped set.
+	if dumpDeviceType(r.files) == "URL" {
+		for _, file := range r.files {
+			if err := r.readBatch([]string{file}, ops, fn); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
 	// Process at most maxFilesPerCall files per fn_dump_dblog call.
 	for i := 0; i < len(r.files); i += maxFilesPerCall {
 		end := i + maxFilesPerCall
@@ -87,10 +100,11 @@ func (r *TRNReader) readBatch(files []string, ops []string, fn func(*LogRecord) 
 func buildDumpQuery(startLSN, endLSN string, files []string, ops []string) string {
 	var sb strings.Builder
 
-	sb.WriteString("SELECT [Current LSN],[Operation],[Context],[Transaction ID],")
-	sb.WriteString("[AllocUnitName],[Begin time],[End time],")
+	sb.WriteString("SELECT [Current LSN],[Operation],[Context],[Transaction ID],[Transaction Name],")
+	sb.WriteString("[AllocUnitName],[AllocUnitId],[PartitionId],[Page ID],[Slot ID],[Begin time],[End time],")
 	sb.WriteString("[RowLog Contents 0],[RowLog Contents 1],[RowLog Contents 2],")
-	sb.WriteString("[RowLog Contents 3],[RowLog Contents 4],[Log Record]")
+	sb.WriteString("[RowLog Contents 3],[RowLog Contents 4],[Log Record],")
+	sb.WriteString("[Offset in Row],[Modify Size]")
 	sb.WriteString(" FROM fn_dump_dblog(")
 
 	// param 1: start LSN
@@ -108,8 +122,9 @@ func buildDumpQuery(startLSN, endLSN string, files []string, ops []string) strin
 		fmt.Fprintf(&sb, "N'%s'", escapeSQ(endLSN))
 	}
 
-	// param 3: device type
-	sb.WriteString(",N'DISK'")
+	// param 3: SQL Server backup device type. S3/Azure object storage
+	// backups are URL devices even when the path uses the s3:// scheme.
+	fmt.Fprintf(&sb, ",N'%s'", dumpDeviceType(files))
 
 	// param 4: number of files
 	fmt.Fprintf(&sb, ",%d", len(files))
@@ -135,6 +150,18 @@ func buildDumpQuery(startLSN, endLSN string, files []string, ops []string) strin
 	}
 
 	return sb.String()
+}
+
+func dumpDeviceType(files []string) string {
+	for _, f := range files {
+		lower := strings.ToLower(strings.TrimSpace(f))
+		if strings.HasPrefix(lower, "s3://") ||
+			strings.HasPrefix(lower, "https://") ||
+			strings.HasPrefix(lower, "http://") {
+			return "URL"
+		}
+	}
+	return "DISK"
 }
 
 // escapeSQ escapes single quotes for embedding in an SQL string literal.
@@ -179,6 +206,8 @@ func scanRecord(rows *sql.Rows, colNames []string, idx map[string]int) (*LogReco
 			return s
 		case []byte:
 			return string(s)
+		case time.Time:
+			return s.Format("2006/01/02 15:04:05:000")
 		}
 		return fmt.Sprintf("%v", v)
 	}
@@ -193,20 +222,67 @@ func scanRecord(rows *sql.Rows, colNames []string, idx map[string]int) (*LogReco
 		}
 		return b
 	}
+	intVal := func(name string) int {
+		v := get(name)
+		if v == nil {
+			return -1
+		}
+		switch n := v.(type) {
+		case int64:
+			return int(n)
+		case int32:
+			return int(n)
+		case int16:
+			return int(n)
+		case float64:
+			return int(n)
+		}
+		return -1
+	}
+	int64Val := func(name string) int64 {
+		v := get(name)
+		if v == nil {
+			return 0
+		}
+		switch n := v.(type) {
+		case int64:
+			return n
+		case int32:
+			return int64(n)
+		case int16:
+			return int64(n)
+		case float64:
+			return int64(n)
+		}
+		return 0
+	}
+
+	slotRaw := intVal("Slot ID")
+	var slotPtr *int
+	if slotRaw >= 0 {
+		slotPtr = &slotRaw
+	}
 
 	return &LogRecord{
-		LSN:           str("Current LSN"),
-		Operation:     str("Operation"),
-		Context:       str("Context"),
-		TransactionID: str("Transaction ID"),
-		AllocUnitName: str("AllocUnitName"),
-		BeginTime:     str("Begin time"),
-		EndTime:       str("End time"),
-		Contents0:     blob("RowLog Contents 0"),
-		Contents1:     blob("RowLog Contents 1"),
-		Contents2:     blob("RowLog Contents 2"),
-		Contents3:     blob("RowLog Contents 3"),
-		Contents4:     blob("RowLog Contents 4"),
-		RawLogRecord:  blob("Log Record"),
+		LSN:             str("Current LSN"),
+		Operation:       str("Operation"),
+		Context:         str("Context"),
+		TransactionID:   str("Transaction ID"),
+		TransactionName: str("Transaction Name"),
+		AllocUnitName:   str("AllocUnitName"),
+		AllocUnitID:     int64Val("AllocUnitId"),
+		PartitionID:     int64Val("PartitionId"),
+		PageID:          str("Page ID"),
+		SlotID:          slotPtr,
+		BeginTime:       str("Begin time"),
+		EndTime:         str("End time"),
+		Contents0:       blob("RowLog Contents 0"),
+		Contents1:       blob("RowLog Contents 1"),
+		Contents2:       blob("RowLog Contents 2"),
+		Contents3:       blob("RowLog Contents 3"),
+		Contents4:       blob("RowLog Contents 4"),
+		RawLogRecord:    blob("Log Record"),
+		OffsetInRow:     intVal("Offset in Row"),
+		ModifySize:      intVal("Modify Size"),
 	}, nil
 }

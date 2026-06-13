@@ -28,6 +28,7 @@ func rootCmd() *cobra.Command {
 		dbName   string
 		allDBs   bool
 		since    string
+		dataDir  string
 	)
 	root := &cobra.Command{
 		Use:   "logrecovery",
@@ -42,7 +43,7 @@ http://localhost:<port> to browse and filter events.`,
 			if err != nil {
 				return err
 			}
-			return runServe(httpPort, host, user, pass, sqlPort, dbName, allDBs, sinceTime)
+			return runServe(httpPort, host, user, pass, sqlPort, dbName, allDBs, sinceTime, dataDir)
 		},
 	}
 	root.Flags().IntVar(&httpPort, "port", 8182, "HTTP listen port for the REST API")
@@ -53,6 +54,7 @@ http://localhost:<port> to browse and filter events.`,
 	root.Flags().StringVar(&dbName, "db", "", "Database to scan")
 	root.Flags().BoolVar(&allDBs, "all-dbs", false, "Scan all online user databases")
 	root.Flags().StringVar(&since, "since", "24h", "History window: 24h | 7d | 30d | all | now")
+	root.Flags().StringVar(&dataDir, "data-dir", "", "Directory for persistent DuckDB storage (default: ./data next to executable)")
 	root.AddCommand(schemaCmd())
 	return root
 }
