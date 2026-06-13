@@ -6,10 +6,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/uns/mssqllogrecovery/internal/logparser"
 )
@@ -35,34 +37,78 @@ func (NopPageReader) ReadCurrentRowImage(_ context.Context, _ logparser.LogRecor
 }
 
 // SQLPageReader reads and caches slot images from DBCC PAGE.
+//
+// DBCC PAGE is expensive (full-page dump, competes with the live workload), so
+// reads are cached aggressively. A page is fetched at most once per ttl window;
+// the cache is bounded by maxPages and shared across poll cycles via the
+// persistent generator. Set LOGRECOVERY_DISABLE_PAGE_READER=1 to skip DBCC
+// entirely (forward INSERT-replay decoding still works without it).
 type SQLPageReader struct {
 	db       *sql.DB
 	database string
+	ttl      time.Duration
+	maxPages int
+	disabled bool
 	mu       sync.Mutex
 	pages    map[string]map[int][]byte
+	fetched  map[string]time.Time
 }
 
 func NewSQLPageReader(db *sql.DB, database string) *SQLPageReader {
-	return &SQLPageReader{db: db, database: database, pages: make(map[string]map[int][]byte)}
+	r := &SQLPageReader{
+		db: db, database: database,
+		ttl:      120 * time.Second,
+		maxPages: 4096,
+		pages:    make(map[string]map[int][]byte),
+		fetched:  make(map[string]time.Time),
+	}
+	if v := os.Getenv("LOGRECOVERY_DISABLE_PAGE_READER"); v == "1" || strings.EqualFold(v, "true") {
+		r.disabled = true
+	}
+	if secs, err := strconv.Atoi(os.Getenv("LOGRECOVERY_PAGE_TTL_SEC")); err == nil && secs >= 0 {
+		r.ttl = time.Duration(secs) * time.Second
+	}
+	return r
+}
+
+// Reset drops the page cache. Call when the table schema/layout changes so stale
+// page images are not reused against a new column layout.
+func (r *SQLPageReader) Reset() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.pages = make(map[string]map[int][]byte)
+	r.fetched = make(map[string]time.Time)
+	r.mu.Unlock()
 }
 
 func (r *SQLPageReader) ReadCurrentRowImage(ctx context.Context, rec logparser.LogRecord, _ string) ([]byte, error) {
-	if r == nil || r.db == nil || rec.PageID == "" || rec.SlotID == nil {
+	if r == nil || r.db == nil || r.disabled || rec.PageID == "" || rec.SlotID == nil {
 		return nil, ErrMR1NotFound
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if slots, ok := r.pages[rec.PageID]; ok {
-		if row := slots[*rec.SlotID]; len(row) > 0 {
-			return append([]byte(nil), row...), nil
+		if r.ttl == 0 || time.Since(r.fetched[rec.PageID]) < r.ttl {
+			if row := slots[*rec.SlotID]; len(row) > 0 {
+				return append([]byte(nil), row...), nil
+			}
+			return nil, ErrMR1NotFound
 		}
-		return nil, ErrMR1NotFound
 	}
 	slots, err := r.readPage(ctx, rec.PageID)
 	if err != nil {
 		return nil, err
 	}
+	if len(r.pages) >= r.maxPages {
+		// Crude bound: clear when full. Cheaper than LRU bookkeeping and rare
+		// because the forward cache handles the hot path without DBCC.
+		r.pages = make(map[string]map[int][]byte)
+		r.fetched = make(map[string]time.Time)
+	}
 	r.pages[rec.PageID] = slots
+	r.fetched[rec.PageID] = time.Now()
 	row := slots[*rec.SlotID]
 	if len(row) == 0 {
 		return nil, ErrMR1NotFound

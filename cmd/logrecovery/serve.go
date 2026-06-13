@@ -174,6 +174,12 @@ type dbPollState struct {
 	beginTimes    map[string]time.Time
 	excluded      map[string]bool
 	schemaVersion string
+	// gen and pageReader persist across poll cycles so the row-image cache
+	// survives — warm rows decode forward (INSERT replay) with no DBCC PAGE.
+	// Recreating them every poll cold-started the cache and flooded SQL Server
+	// with DBCC PAGE calls.
+	gen        *dml.Generator
+	pageReader *mssql.SQLPageReader
 }
 
 func getPollState(dbName string) *dbPollState {
@@ -607,6 +613,7 @@ func pollLDF(ctx context.Context, server, user, pass, dbName string) error {
 		return nil
 	}
 
+	schemaChanged := false
 	if version, versionErr := readSchemaVersion(srcDB); versionErr == nil &&
 		(state.schemaVersion == "" || version != state.schemaVersion) {
 		refreshed, refreshErr := schema.Extract(srcDB)
@@ -616,6 +623,7 @@ func pollLDF(ctx context.Context, server, user, pass, dbName string) error {
 		oldCount := len(sch.Tables)
 		sch = refreshed
 		state.schemaVersion = version
+		schemaChanged = true
 		appMu.Lock()
 		appSchemas[dbName] = refreshed
 		appMu.Unlock()
@@ -627,8 +635,20 @@ func pollLDF(ctx context.Context, server, user, pass, dbName string) error {
 	startLSN := ldfCheckpoint[dbName]
 	checkpointMu.RUnlock()
 
-	pageReader := mssql.NewSQLPageReader(srcDB, dbName)
-	gen := dml.NewWithPageReader(sch, pageReader)
+	// Reuse the persistent page reader + generator so the row-image cache carries
+	// over between polls (warm rows decode forward, no DBCC PAGE). Rebuild the
+	// generator only on first poll or when the schema changed.
+	if state.pageReader == nil {
+		state.pageReader = mssql.NewSQLPageReader(srcDB, dbName)
+	}
+	pageReader := state.pageReader
+	if state.gen == nil || schemaChanged {
+		if schemaChanged {
+			pageReader.Reset()
+		}
+		state.gen = dml.NewWithPageReader(sch, pageReader)
+	}
+	gen := state.gen
 	var maxLSN string
 	refreshedUnknownStorage := false
 
@@ -649,7 +669,9 @@ func pollLDF(ctx context.Context, server, user, pass, dbName string) error {
 			refreshed, refreshErr := schema.Extract(srcDB)
 			if refreshErr == nil {
 				sch = refreshed
+				pageReader.Reset()
 				gen = dml.NewWithPageReader(refreshed, pageReader)
+				state.gen = gen
 				appMu.Lock()
 				appSchemas[dbName] = refreshed
 				appMu.Unlock()
