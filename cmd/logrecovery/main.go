@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"strings"
 
 	_ "github.com/microsoft/go-mssqldb"
 	"github.com/spf13/cobra"
@@ -43,7 +44,8 @@ http://localhost:<port> to browse and filter events.`,
 			if err != nil {
 				return err
 			}
-			return runServe(httpPort, host, user, pass, sqlPort, dbName, allDBs, sinceTime, dataDir)
+			includeHistorical := includeHistoricalForSince(since)
+			return runServe(httpPort, host, user, pass, sqlPort, dbName, allDBs, sinceTime, includeHistorical, dataDir)
 		},
 	}
 	root.Flags().IntVar(&httpPort, "port", 8182, "HTTP listen port for the REST API")
@@ -57,6 +59,10 @@ http://localhost:<port> to browse and filter events.`,
 	root.Flags().StringVar(&dataDir, "data-dir", "", "Directory for persistent DuckDB storage (default: ./data next to executable)")
 	root.AddCommand(schemaCmd())
 	return root
+}
+
+func includeHistoricalForSince(s string) bool {
+	return !strings.EqualFold(strings.TrimSpace(s), "now")
 }
 
 // ── schema extract ──────────────────────────────────────────────────────────

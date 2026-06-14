@@ -39,10 +39,8 @@ func (NopPageReader) ReadCurrentRowImage(_ context.Context, _ logparser.LogRecor
 // SQLPageReader reads and caches slot images from DBCC PAGE.
 //
 // DBCC PAGE is expensive (full-page dump, competes with the live workload), so
-// reads are cached aggressively. A page is fetched at most once per ttl window;
-// the cache is bounded by maxPages and shared across poll cycles via the
-// persistent generator. Set LOGRECOVERY_DISABLE_PAGE_READER=1 to skip DBCC
-// entirely (forward INSERT-replay decoding still works without it).
+// it is disabled by default. Set LOGRECOVERY_ENABLE_PAGE_READER=1 to opt in.
+// Reads are cached aggressively when enabled.
 type SQLPageReader struct {
 	db       *sql.DB
 	database string
@@ -62,13 +60,30 @@ func NewSQLPageReader(db *sql.DB, database string) *SQLPageReader {
 		pages:    make(map[string]map[int][]byte),
 		fetched:  make(map[string]time.Time),
 	}
-	if v := os.Getenv("LOGRECOVERY_DISABLE_PAGE_READER"); v == "1" || strings.EqualFold(v, "true") {
+	r.disabled = !envBool("LOGRECOVERY_ENABLE_PAGE_READER")
+	if envBool("LOGRECOVERY_DISABLE_PAGE_READER") {
 		r.disabled = true
 	}
 	if secs, err := strconv.Atoi(os.Getenv("LOGRECOVERY_PAGE_TTL_SEC")); err == nil && secs >= 0 {
 		r.ttl = time.Duration(secs) * time.Second
 	}
 	return r
+}
+
+func envBool(name string) bool {
+	v := os.Getenv(name)
+	return v == "1" || strings.EqualFold(v, "true")
+}
+
+// BindDB replaces the short-lived poll connection used for future cache misses.
+// The page cache itself survives across polls.
+func (r *SQLPageReader) BindDB(db *sql.DB) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.db = db
+	r.mu.Unlock()
 }
 
 // Reset drops the page cache. Call when the table schema/layout changes so stale

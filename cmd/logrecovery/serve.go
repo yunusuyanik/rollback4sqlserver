@@ -119,7 +119,7 @@ func shortLSN(lsn string) string {
 	return a + ":" + b
 }
 
-func runServe(httpPort int, host, user, pass string, sqlPort int, dbName string, allDBs bool, sinceTime time.Time, dataDir string) error {
+func runServe(httpPort int, host, user, pass string, sqlPort int, dbName string, allDBs bool, sinceTime time.Time, includeHistorical bool, dataDir string) error {
 	bgCtx, bgCancel = context.WithCancel(context.Background())
 
 	dbPath := store.ResolveDBPath(dataDir)
@@ -150,7 +150,7 @@ func runServe(httpPort int, host, user, pass string, sqlPort int, dbName string,
 		sessMu.Unlock()
 
 		if dbName != "" || allDBs {
-			go runAutoScan(server, user, pass, dbName, allDBs, sinceTime)
+			go runAutoScan(server, user, pass, dbName, allDBs, sinceTime, includeHistorical)
 		} else {
 			logf("no --db or --all-dbs specified — connect via UI or add flag")
 		}
@@ -212,7 +212,7 @@ func pruneStalePollState(state *dbPollState) {
 
 // ── Auto-scan orchestration ───────────────────────────────────────────────────
 
-func runAutoScan(server, user, pass, dbName string, allDBs bool, sinceTime time.Time) {
+func runAutoScan(server, user, pass, dbName string, allDBs bool, sinceTime time.Time, includeHistorical bool) {
 	setProgress(func(p *ScanProgress) { p.Running = true; p.Message = "Connecting…" })
 
 	logf("connecting to SQL Server at %s", server)
@@ -236,7 +236,7 @@ func runAutoScan(server, user, pass, dbName string, allDBs bool, sinceTime time.
 		default:
 		}
 		setProgress(func(p *ScanProgress) { p.Message = fmt.Sprintf("Initial scan: %s…", db) })
-		if err := scanDatabase(bgCtx, server, user, pass, db, sinceTime); err != nil && err != context.Canceled {
+		if err := scanDatabase(bgCtx, server, user, pass, db, sinceTime, includeHistorical); err != nil && err != context.Canceled {
 			logf("ERROR [%s]: %v", db, err)
 			setProgress(func(p *ScanProgress) { p.ErrMsg = fmt.Sprintf("%s: %v", db, err) })
 		}
@@ -300,7 +300,7 @@ func resolveTargetDBs(server, user, password, dbName string, allDBs bool) ([]str
 // On restart it resumes from the persisted LSN checkpoint, skipping events
 // already stored in the DB. The UNIQUE(db_name, lsn) constraint provides a
 // second line of defence in case of overlap.
-func scanDatabase(ctx context.Context, server, user, pass, dbName string, sinceTime time.Time) error {
+func scanDatabase(ctx context.Context, server, user, pass, dbName string, sinceTime time.Time, includeHistorical bool) error {
 	srcDB, err := openConnection(server, user, pass, dbName)
 	if err != nil {
 		return err
@@ -414,7 +414,7 @@ func scanDatabase(ctx context.Context, server, user, pass, dbName string, sinceT
 		return nil
 	}
 
-	if !sinceTime.IsZero() {
+	if includeHistorical && !sinceTime.IsZero() {
 		files, backupErr := historicalLogBackupFiles(ctx, srcDB, dbName, sinceTime)
 		switch {
 		case backupErr != nil:
@@ -640,6 +640,8 @@ func pollLDF(ctx context.Context, server, user, pass, dbName string) error {
 	// generator only on first poll or when the schema changed.
 	if state.pageReader == nil {
 		state.pageReader = mssql.NewSQLPageReader(srcDB, dbName)
+	} else {
+		state.pageReader.BindDB(srcDB)
 	}
 	pageReader := state.pageReader
 	if state.gen == nil || schemaChanged {
@@ -1011,8 +1013,8 @@ func buildMux() http.Handler {
 	// Log data
 	mux.HandleFunc("/api/logs", handleLogs)         // event feed — primary endpoint
 	mux.HandleFunc("/api/timeline", handleTimeline) // timeline — server-side bucket counts
-	mux.HandleFunc("/api/search", handleSearch) // time-range filtered search
-	mux.HandleFunc("/api/events", handleEvents) // legacy compat
+	mux.HandleFunc("/api/search", handleSearch)     // time-range filtered search
+	mux.HandleFunc("/api/events", handleEvents)     // legacy compat
 	mux.HandleFunc("/api/diagnostics", handleDiagnostics)
 	mux.HandleFunc("/api/stats", handleStats)
 	mux.HandleFunc("/api/export", handleExport)

@@ -256,75 +256,24 @@ tailwind.config = {
         </div>
       </div>
 
-      <!-- ░░ DESIGN 1 — Lollipop ░░ -->
-      <div class="mb-1">
-        <div class="text-[8px] font-bold uppercase tracking-widest text-brand-400/70 mb-0.5">Design 1 · Lollipop</div>
-        <div class="relative h-10">
-          <template x-for="tick in timelineTicks" :key="'a'+tick.t">
+      <!-- Activity histogram: height = volume, color mix = operation distribution -->
+      <div class="relative h-16">
+          <template x-for="tick in timelineTicks" :key="tick.t">
             <div class="absolute top-0 bottom-0 w-px bg-stone-100" :style="`left: ${tick.pct * 100}%`"></div>
           </template>
           <div class="absolute bottom-0 left-0 right-0 h-px bg-stone-200"></div>
-          <template x-for="b in timelineBuckets" :key="'a'+b.i">
-            <div class="absolute bottom-0 -translate-x-1/2 flex flex-col items-center justify-end cursor-pointer group"
-                 style="height: 100%; width: 16px" :style="`left: ${b.pct * 100}%`"
+          <template x-for="b in timelineAll" :key="b.i">
+            <div class="absolute bottom-0 flex flex-col-reverse items-stretch justify-start cursor-pointer rounded-t-sm overflow-hidden
+                        transition-opacity hover:opacity-70"
+                 :class="b.total === 0 ? 'bg-stone-100' : ''"
+                 :style="`left: ${b.left*100}%; width: max(2px, calc(${b.width*100}% - 1px)); height: ${b.total ? Math.max(4,b.barH*1.75) : 2}px`"
                  @mouseenter="tlHover = b" @mouseleave="tlHover = null" @click="selectFromBucket(b)">
-              <div class="rounded-full border-2 border-white shadow-sm transition-transform group-hover:scale-125"
-                   :style="`width: ${b.dotR*2}px; height: ${b.dotR*2}px`"
-                   :class="{ 'bg-green-500': b.dom==='INSERT','bg-amber-400': b.dom==='UPDATE','bg-red-500': b.dom==='DELETE' }"></div>
-              <div class="w-0.5 bg-stone-300 group-hover:bg-stone-400" :style="`height: ${b.stickH}px`"></div>
+              <div class="bg-green-500" :style="`height: ${b.total ? b.insert/b.total*100 : 0}%`"></div>
+              <div class="bg-amber-400" :style="`height: ${b.total ? b.update/b.total*100 : 0}%`"></div>
+              <div class="bg-red-500"   :style="`height: ${b.total ? b.delete/b.total*100 : 0}%`"></div>
             </div>
           </template>
-          <div class="absolute right-0 top-0 bottom-0 flex items-end"><div class="w-0.5 h-8 bg-stone-500 rounded-full"></div></div>
-        </div>
-      </div>
-
-      <!-- ░░ DESIGN 2 — Stacked bars ░░ -->
-      <div class="mb-1">
-        <div class="text-[8px] font-bold uppercase tracking-widest text-brand-400/70 mb-0.5">Design 2 · Stacked Bars</div>
-        <div class="relative h-10">
-          <template x-for="tick in timelineTicks" :key="'b'+tick.t">
-            <div class="absolute top-0 bottom-0 w-px bg-stone-100" :style="`left: ${tick.pct * 100}%`"></div>
-          </template>
-          <div class="absolute bottom-0 left-0 right-0 h-px bg-stone-200"></div>
-          <template x-for="b in timelineBuckets" :key="'b'+b.i">
-            <div class="absolute bottom-0 flex flex-col-reverse items-stretch justify-start cursor-pointer rounded-t overflow-hidden hover:opacity-80"
-                 :style="`left: ${b.left*100}%; width: calc(${b.width*100}% - 1px); height: ${b.barH}px`"
-                 @mouseenter="tlHover = b" @mouseleave="tlHover = null" @click="selectFromBucket(b)">
-              <div class="bg-green-500" :style="`height: ${b.insH}px`"></div>
-              <div class="bg-amber-400" :style="`height: ${b.updH}px`"></div>
-              <div class="bg-red-500"   :style="`height: ${b.delH}px`"></div>
-            </div>
-          </template>
-          <div class="absolute right-0 top-0 bottom-0 flex items-end"><div class="w-0.5 h-8 bg-stone-500 rounded-full"></div></div>
-        </div>
-      </div>
-
-      <!-- ░░ DESIGN 3 — Ridgeline area ░░ -->
-      <div class="mb-1">
-        <div class="text-[8px] font-bold uppercase tracking-widest text-brand-400/70 mb-0.5">Design 3 · Density Ridgeline</div>
-        <div class="relative h-10">
-          <template x-for="tick in timelineTicks" :key="'c'+tick.t">
-            <div class="absolute top-0 bottom-0 w-px bg-stone-100" :style="`left: ${tick.pct * 100}%`"></div>
-          </template>
-          <div class="absolute bottom-0 left-0 right-0 h-px bg-stone-200"></div>
-          <svg class="absolute inset-x-0 bottom-0 w-full h-8" viewBox="0 0 1000 32" preserveAspectRatio="none">
-            <defs>
-              <linearGradient id="tlGrad" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stop-color="rgb(99,102,241)" stop-opacity="0.45"></stop>
-                <stop offset="100%" stop-color="rgb(99,102,241)" stop-opacity="0.04"></stop>
-              </linearGradient>
-            </defs>
-            <path :d="timelineAreaPath.fill" fill="url(#tlGrad)"></path>
-            <path :d="timelineAreaPath.line" fill="none" stroke="rgb(99,102,241)" stroke-width="1.5" vector-effect="non-scaling-stroke"></path>
-          </svg>
-          <!-- transparent hover/click columns -->
-          <template x-for="b in timelineBuckets" :key="'c'+b.i">
-            <div class="absolute bottom-0 top-0 cursor-pointer hover:bg-brand-500/5"
-                 :style="`left: ${b.left*100}%; width: ${b.width*100}%`"
-                 @mouseenter="tlHover = b" @mouseleave="tlHover = null" @click="selectFromBucket(b)"></div>
-          </template>
-          <div class="absolute right-0 top-0 bottom-0 flex items-end"><div class="w-0.5 h-8 bg-stone-500 rounded-full"></div></div>
-        </div>
+          <div class="absolute right-0 top-0 bottom-0 w-0.5 bg-stone-500 rounded-full"></div>
       </div>
 
       <!-- Shared hover tooltip -->
@@ -589,7 +538,6 @@ function dashboard() {
     timelineBuckets_N: 72,
     timelineErr:      '',   // last /api/timeline fetch error (shown in header)
     tlHover:          null,
-    tlDesign:         1,    // 1=lollipop  2=stacked bars  3=ridgeline area
 
     get timelineStart() { return this.timelineNow - this.timelineWindowMs; },
 
@@ -646,21 +594,6 @@ function dashboard() {
 
     // Non-empty buckets (lollipop design only renders these).
     get timelineBuckets() { return this.timelineAll.filter(b => b.total > 0); },
-
-    // SVG area path for design 3 (ridgeline). Uses all buckets for a smooth line.
-    get timelineAreaPath() {
-      const all = this.timelineAll;
-      if (!all.length) return { line: '', fill: '' };
-      const W = 1000, H = 32;
-      const pts = all.map(b => {
-        const x = b.left * W + (b.width * W) / 2;
-        const y = H - b.frac * H;
-        return [x, y];
-      });
-      pts.unshift([0, H]); pts.push([W, H]);
-      const line = pts.map((p, i) => (i === 0 ? 'M' : 'L') + p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join(' ');
-      return { line, fill: line + ` L${W} ${H} L0 ${H} Z` };
-    },
 
     get timelineTotalCount() { return this.timelineData.reduce((s, d) => s + (d.total||0), 0); },
 
