@@ -380,9 +380,10 @@ tailwind.config = {
                   <button @click="toggleTransactionExpanded(group)"
                     class="text-[10px] font-bold uppercase tracking-widest text-stone-400 hover:text-stone-800 border border-stone-200 px-2.5 py-1 rounded transition whitespace-nowrap"
                     x-text="expandedTxns[group.db_name + group.txn_id] ? 'Hide rows' : 'Show rows'"></button>
-                  <button @click="showTransactionRollback(group)"
-                    class="text-[10px] font-bold uppercase tracking-widest text-brand-600 hover:text-brand-700 border border-brand-200 px-2.5 py-1 rounded transition whitespace-nowrap">
-                    Rollback →
+                  <button @click="showTransactionRollback(group)" :disabled="!group.rollback_count"
+                    :class="group.rollback_count ? 'text-brand-600 hover:text-brand-700 border-brand-200' : 'text-stone-300 border-stone-200 cursor-not-allowed'"
+                    class="text-[10px] font-bold uppercase tracking-widest border px-2.5 py-1 rounded transition whitespace-nowrap"
+                    x-text="group.rollback_count ? `Rollback ${group.rollback_count} →` : 'No rollback'">
                   </button>
                 </div>
               </div>
@@ -447,7 +448,7 @@ tailwind.config = {
                 class="text-[10px] font-bold uppercase tracking-widest text-stone-400 hover:text-stone-800 border border-stone-200 hover:border-stone-400 px-2.5 py-1 rounded transition whitespace-nowrap">
                 SQL →
               </button>
-              <button x-show="ev.rollback_sql" @click="showRollback(ev)"
+              <button x-show="isExecutableRollback(ev)" @click="showRollback(ev)"
                 class="text-[10px] font-bold uppercase tracking-widest text-brand-600 hover:text-brand-700 border border-brand-200 hover:border-brand-400 px-2.5 py-1 rounded transition whitespace-nowrap">
                 Rollback →
               </button>
@@ -905,6 +906,10 @@ function dashboard() {
       };
     },
 
+    isExecutableRollback(ev) {
+      return !!(ev?.rollback_sql && !ev.rollback_sql.trim().startsWith('--'));
+    },
+
     copyModal() {
       navigator.clipboard.writeText(this.modal.sql).then(() => {
         this.modal.copied = true;
@@ -945,6 +950,7 @@ function dashboard() {
     },
 
     showTransactionRollback(group) {
+      if (!group.rollback_count) return;
       const evs = (group.events || [])
         .filter(ev => ev.rollback_sql && !ev.rollback_sql.startsWith('--'))
         .sort((a, b) => b.lsn.localeCompare(a.lsn));

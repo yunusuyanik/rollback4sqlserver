@@ -243,6 +243,9 @@ func TestHandleTransactionsGroupsRowsAndPaginatesTransactions(t *testing.T) {
 	if got.TxnID != "0000:0001" || got.RowCount != 3 || got.Inserts != 1 || got.Updates != 1 || got.Deletes != 1 {
 		t.Fatalf("group=%+v want txn 0000:0001 with 3 mixed rows", got)
 	}
+	if got.Rollbacks != 3 {
+		t.Fatalf("rollback_count=%d want 3", got.Rollbacks)
+	}
 	if len(got.Events) != 3 || got.Events[0].LSN != "00000001:00000001:0001" || got.Events[2].LSN != "00000001:00000001:0003" {
 		t.Fatalf("events=%+v want ascending LSN order", got.Events)
 	}

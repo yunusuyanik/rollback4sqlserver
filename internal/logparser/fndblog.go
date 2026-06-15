@@ -11,8 +11,9 @@ import (
 )
 
 // LDFReader reads live transaction log records from fn_dblog on a running
-// SQL Server instance. Always calls fn_dblog(NULL,NULL) filtered by
-// WHERE [Current LSN] > startLSN. Read-only — no DML/DDL.
+// SQL Server instance. It always calls fn_dblog(NULL,NULL) and applies the LSN
+// cursor in the outer WHERE clause. Some SQL Server builds reject otherwise
+// valid record LSNs as fn_dblog's OpenRowset start parameter.
 type LDFReader struct {
 	db        *sql.DB
 	startLSN  string // exclusive lower bound ("" = from active-log head)
@@ -121,13 +122,7 @@ func buildLiveChunkQuery(afterLSN string, chunkSize int) string {
 	sb.WriteString("[RowLog Contents 0],[RowLog Contents 1],[RowLog Contents 2],")
 	sb.WriteString("[RowLog Contents 3],[RowLog Contents 4],[Log Record],")
 	sb.WriteString("[Offset in Row],[Modify Size]")
-	sb.WriteString(" FROM fn_dblog(")
-	if afterLSN == "" {
-		sb.WriteString("NULL")
-	} else {
-		fmt.Fprintf(&sb, "N'%s'", escapeSQ(afterLSN))
-	}
-	sb.WriteString(",NULL)")
+	sb.WriteString(" FROM fn_dblog(NULL,NULL)")
 	sb.WriteString(" WHERE (")
 	sb.WriteString("[Operation] IN (N'LOP_BEGIN_XACT',N'LOP_COMMIT_XACT',N'LOP_ABORT_XACT')")
 	sb.WriteString(" OR (")

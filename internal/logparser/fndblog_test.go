@@ -10,13 +10,16 @@ func TestBuildLiveChunkQueryUsesLSNCursorAndLimit(t *testing.T) {
 
 	for _, want := range []string{
 		"SELECT TOP (5000)",
-		"fn_dblog(N'000000CE:00000418:0010',NULL)",
+		"fn_dblog(NULL,NULL)",
 		"[Current LSN]>N'000000CE:00000418:0010'",
 		"ORDER BY [Current LSN]",
 	} {
 		if !strings.Contains(query, want) {
 			t.Fatalf("query missing %q: %s", want, query)
 		}
+	}
+	if strings.Contains(query, "fn_dblog(N'000000CE:00000418:0010'") {
+		t.Fatalf("query passes cursor to OpenRowset start parameter: %s", query)
 	}
 }
 

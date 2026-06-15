@@ -1316,6 +1316,7 @@ type transactionGroup struct {
 	Inserts    int        `json:"inserts"`
 	Updates    int        `json:"updates"`
 	Deletes    int        `json:"deletes"`
+	Rollbacks  int        `json:"rollback_count"`
 	Tables     []string   `json:"tables"`
 	Events     []logEvent `json:"events"`
 }
@@ -1430,6 +1431,9 @@ func handleTransactions(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			groups[i].Events = append(groups[i].Events, event)
+			if isExecutableSQL(event.RollbackSQL) {
+				groups[i].Rollbacks++
+			}
 			table := event.Table
 			if event.SchemaName != "" {
 				table = event.SchemaName + "." + event.Table
@@ -1460,6 +1464,11 @@ func appendWhereCondition(where, condition string) string {
 
 func transactionKey(database, txnID string) string {
 	return database + "\x00" + txnID
+}
+
+func isExecutableSQL(statement string) bool {
+	statement = strings.TrimSpace(statement)
+	return statement != "" && !strings.HasPrefix(statement, "--")
 }
 
 // GET /api/timeline?since=...&until=...&buckets=72&db=&table=&op=&search=
