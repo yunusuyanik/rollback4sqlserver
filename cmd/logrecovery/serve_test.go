@@ -80,7 +80,7 @@ func TestHandleTimelineBuckets(t *testing.T) {
 		mk("00000001:00000001:0001", "INSERT", base.Add(1*time.Minute)),
 		mk("00000001:00000001:0002", "UPDATE", base.Add(2*time.Minute)),
 		mk("00000001:00000001:0003", "DELETE", base.Add(3*time.Minute)),
-		mk("00000001:00000001:0004", "UPDATE", base.Add(6 * time.Hour)),
+		mk("00000001:00000001:0004", "UPDATE", base.Add(6*time.Hour)),
 	} {
 		if err := st.Write(s); err != nil {
 			t.Fatal(err)
@@ -173,5 +173,80 @@ func TestHandleTimelineRealClientCall(t *testing.T) {
 	}
 	if total != 4 {
 		t.Fatalf("total events=%d want 4 (timeline empty → bug)", total)
+	}
+}
+
+func TestHandleTransactionsGroupsRowsAndPaginatesTransactions(t *testing.T) {
+	st, err := store.OpenDuckDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	base := time.Date(2026, 6, 14, 10, 0, 0, 0, time.UTC)
+	events := []*dml.Statement{
+		{
+			LSN: "00000001:00000001:0001", TransactionID: "0000:0001",
+			Operation: "INSERT", Table: "[dbo].[Orders]", Database: "db",
+			SQL: "INSERT 1", RollbackSQL: "DELETE 1", Timestamp: base, CommitTime: base.Add(time.Second),
+		},
+		{
+			LSN: "00000001:00000001:0002", TransactionID: "0000:0001",
+			Operation: "UPDATE", Table: "[dbo].[Orders]", Database: "db",
+			SQL: "UPDATE 1", RollbackSQL: "UPDATE BACK 1", Timestamp: base, CommitTime: base.Add(time.Second),
+		},
+		{
+			LSN: "00000001:00000001:0003", TransactionID: "0000:0001",
+			Operation: "DELETE", Table: "[sales].[Items]", Database: "db",
+			SQL: "DELETE 1", RollbackSQL: "INSERT BACK 1", Timestamp: base, CommitTime: base.Add(time.Second),
+		},
+		{
+			LSN: "00000001:00000002:0001", TransactionID: "0000:0002",
+			Operation: "UPDATE", Table: "[dbo].[Customers]", Database: "db",
+			SQL: "UPDATE 2", RollbackSQL: "UPDATE BACK 2", Timestamp: base.Add(time.Minute), CommitTime: base.Add(time.Minute + time.Second),
+		},
+	}
+	for _, event := range events {
+		if err := st.Write(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	appMu.Lock()
+	appStore = st
+	appMu.Unlock()
+	defer func() { appMu.Lock(); appStore = nil; appMu.Unlock() }()
+
+	rec := httptest.NewRecorder()
+	handleTransactions(rec, httptest.NewRequest("GET", "/api/transactions?limit=20&page=1", nil))
+	if rec.Code != 200 {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var resp struct {
+		Total        int                `json:"total"`
+		Transactions []transactionGroup `json:"transactions"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Total != 2 || len(resp.Transactions) != 2 {
+		t.Fatalf("total=%d groups=%d want 2", resp.Total, len(resp.Transactions))
+	}
+	if got := resp.Transactions[0]; got.TxnID != "0000:0002" || got.RowCount != 1 {
+		t.Fatalf("first group=%+v want latest txn 0000:0002", got)
+	}
+	got := resp.Transactions[1]
+	if got.TxnID != "0000:0001" || got.RowCount != 3 || got.Inserts != 1 || got.Updates != 1 || got.Deletes != 1 {
+		t.Fatalf("group=%+v want txn 0000:0001 with 3 mixed rows", got)
+	}
+	if len(got.Events) != 3 || got.Events[0].LSN != "00000001:00000001:0001" || got.Events[2].LSN != "00000001:00000001:0003" {
+		t.Fatalf("events=%+v want ascending LSN order", got.Events)
+	}
+	if len(got.Tables) != 2 || got.Tables[0] != "dbo.Orders" || got.Tables[1] != "sales.Items" {
+		t.Fatalf("tables=%v", got.Tables)
 	}
 }

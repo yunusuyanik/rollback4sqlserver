@@ -22,12 +22,13 @@ type TRNReader struct {
 	startLSN  string   // "" = from beginning
 	endLSN    string   // "" = to end
 	chunkSize int      // max LSN records per call; 0 = unlimited
+	onChunk   func(afterLSN, lastLSN string, count int)
 }
 
 // NewTRNReader constructs a reader. files must be absolute paths accessible
 // from the SQL Server process (not the Go client).
 func NewTRNReader(db *sql.DB, files []string) *TRNReader {
-	return &TRNReader{db: db, files: files}
+	return &TRNReader{db: db, files: files, chunkSize: configuredLogChunkSize()}
 }
 
 // WithLSNRange restricts the scan to [startLSN, endLSN] (inclusive).
@@ -35,6 +36,19 @@ func NewTRNReader(db *sql.DB, files []string) *TRNReader {
 func (r *TRNReader) WithLSNRange(startLSN, endLSN string) *TRNReader {
 	r.startLSN = startLSN
 	r.endLSN = endLSN
+	return r
+}
+
+// WithChunkSize sets the maximum number of records returned by one
+// fn_dump_dblog query. Values <= 0 disable pagination.
+func (r *TRNReader) WithChunkSize(size int) *TRNReader {
+	r.chunkSize = size
+	return r
+}
+
+// WithChunkObserver registers a callback after each SQL page is consumed.
+func (r *TRNReader) WithChunkObserver(fn func(afterLSN, lastLSN string, count int)) *TRNReader {
+	r.onChunk = fn
 	return r
 }
 
@@ -68,39 +82,71 @@ func (r *TRNReader) Read(ops []string, fn func(*LogRecord) error) error {
 }
 
 func (r *TRNReader) readBatch(files []string, ops []string, fn func(*LogRecord) error) error {
-	query := buildDumpQuery(r.startLSN, r.endLSN, files, ops)
+	cursor := r.startLSN
+	for {
+		count, lastLSN, err := r.readBatchChunk(cursor, files, ops, fn)
+		if err != nil {
+			return err
+		}
+		if count > 0 && r.onChunk != nil {
+			r.onChunk(cursor, lastLSN, count)
+		}
+		if count == 0 || r.chunkSize <= 0 || count < r.chunkSize {
+			return nil
+		}
+		if lastLSN == "" || lastLSN == cursor {
+			return fmt.Errorf("fn_dump_dblog pagination did not advance past %q", cursor)
+		}
+		cursor = lastLSN
+	}
+}
+
+func (r *TRNReader) readBatchChunk(startLSN string, files []string, ops []string, fn func(*LogRecord) error) (int, string, error) {
+	query := buildDumpChunkQuery(startLSN, r.endLSN, files, ops, r.chunkSize)
 
 	rows, err := r.db.Query(query)
 	if err != nil {
-		return fmt.Errorf("fn_dump_dblog: %w", err)
+		return 0, "", fmt.Errorf("fn_dump_dblog: %w", err)
 	}
 	defer rows.Close()
 
 	colNames, err := rows.Columns()
 	if err != nil {
-		return err
+		return 0, "", err
 	}
 	idx := columnIndex(colNames)
 
+	count := 0
+	var lastLSN string
 	for rows.Next() {
 		rec, err := scanRecord(rows, colNames, idx)
 		if err != nil {
-			return err
+			return count, lastLSN, err
 		}
 		if err := fn(rec); err != nil {
-			return err
+			return count, lastLSN, err
 		}
+		count++
+		lastLSN = rec.LSN
 	}
-	return rows.Err()
+	return count, lastLSN, rows.Err()
 }
 
 // buildDumpQuery constructs the fn_dump_dblog SELECT statement.
 // File paths are embedded as string literals (single-quote escaped).
 // An optional WHERE clause filters by operation type.
 func buildDumpQuery(startLSN, endLSN string, files []string, ops []string) string {
+	return buildDumpChunkQuery(startLSN, endLSN, files, ops, 0)
+}
+
+func buildDumpChunkQuery(startLSN, endLSN string, files []string, ops []string, chunkSize int) string {
 	var sb strings.Builder
 
-	sb.WriteString("SELECT [Current LSN],[Operation],[Context],[Transaction ID],[Transaction Name],")
+	sb.WriteString("SELECT ")
+	if chunkSize > 0 {
+		fmt.Fprintf(&sb, "TOP (%d) ", chunkSize)
+	}
+	sb.WriteString("[Current LSN],[Operation],[Context],[Transaction ID],[Transaction Name],")
 	sb.WriteString("[AllocUnitName],[AllocUnitId],[PartitionId],[Page ID],[Slot ID],[Begin time],[End time],")
 	sb.WriteString("[RowLog Contents 0],[RowLog Contents 1],[RowLog Contents 2],")
 	sb.WriteString("[RowLog Contents 3],[RowLog Contents 4],[Log Record],")
@@ -148,6 +194,15 @@ func buildDumpQuery(startLSN, endLSN string, files []string, ops []string) strin
 		}
 		fmt.Fprintf(&sb, " WHERE [Operation] IN (%s)", strings.Join(quoted, ","))
 	}
+	if startLSN != "" {
+		if len(ops) > 0 {
+			sb.WriteString(" AND")
+		} else {
+			sb.WriteString(" WHERE")
+		}
+		fmt.Fprintf(&sb, " [Current LSN]>N'%s'", escapeSQ(startLSN))
+	}
+	sb.WriteString(" ORDER BY [Current LSN]")
 
 	return sb.String()
 }

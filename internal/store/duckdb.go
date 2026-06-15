@@ -193,6 +193,7 @@ func (s *DuckDBStore) setupSchema() error {
 		`CREATE INDEX IF NOT EXISTS idx_op     ON log_events(operation)`,
 		`CREATE INDEX IF NOT EXISTS idx_lsn    ON log_events(lsn)`,
 		`CREATE INDEX IF NOT EXISTS idx_time   ON log_events(event_time)`,
+		`CREATE INDEX IF NOT EXISTS idx_txn    ON log_events(db_name, txn_id)`,
 	}
 	for _, ddl := range stmts {
 		if _, err := s.db.Exec(ddl); err != nil {

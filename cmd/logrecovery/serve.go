@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -424,13 +425,22 @@ func scanDatabase(ctx context.Context, server, user, pass, dbName string, sinceT
 				dbName, sinceTime.Format("2006-01-02 15:04:05"))
 		default:
 			logf("[%s] historical scan: reading %d TRN backup file(s)", dbName, len(files))
-			if err := logparser.NewTRNReader(srcDB, files).Read(scanOps(), handler); err != nil && err != context.Canceled {
+			trnReader := logparser.NewTRNReader(srcDB, files).WithChunkObserver(
+				func(afterLSN, lastLSN string, count int) {
+					logf("[%s] TRN chunk: %s records · LSN %s→%s",
+						dbName, fmtN(int64(count)), shortLSN(afterLSN), shortLSN(lastLSN))
+				})
+			if err := trnReader.Read(scanOps(), handler); err != nil && err != context.Canceled {
 				logf("[%s] historical TRN scan failed: %v", dbName, err)
 			}
 		}
 	}
 
-	r := logparser.NewLDFReader(srcDB)
+	r := logparser.NewLDFReader(srcDB).WithChunkObserver(
+		func(afterLSN, lastLSN string, count int) {
+			logf("[%s] LDF chunk: %s records · LSN %s→%s",
+				dbName, fmtN(int64(count)), shortLSN(afterLSN), shortLSN(lastLSN))
+		})
 	if resumeLSN != "" {
 		r = r.WithStartLSN(resumeLSN)
 	}
@@ -1011,7 +1021,8 @@ func buildMux() http.Handler {
 	mux.HandleFunc("/api/progress", handleProgress)
 
 	// Log data
-	mux.HandleFunc("/api/logs", handleLogs)         // event feed — primary endpoint
+	mux.HandleFunc("/api/logs", handleLogs) // event feed — primary endpoint
+	mux.HandleFunc("/api/transactions", handleTransactions)
 	mux.HandleFunc("/api/timeline", handleTimeline) // timeline — server-side bucket counts
 	mux.HandleFunc("/api/search", handleSearch)     // time-range filtered search
 	mux.HandleFunc("/api/events", handleEvents)     // legacy compat
@@ -1292,6 +1303,163 @@ func handleLogs(w http.ResponseWriter, r *http.Request) {
 
 	events := scanEventRows(rows)
 	writeJSON(w, map[string]interface{}{"total": total, "page": page, "limit": limit, "events": events})
+}
+
+type transactionGroup struct {
+	TxnID      string     `json:"txn_id"`
+	Database   string     `json:"db_name"`
+	EventTime  *string    `json:"event_time,omitempty"`
+	CommitTime *string    `json:"commit_time,omitempty"`
+	FirstLSN   string     `json:"first_lsn"`
+	LastLSN    string     `json:"last_lsn"`
+	RowCount   int        `json:"row_count"`
+	Inserts    int        `json:"inserts"`
+	Updates    int        `json:"updates"`
+	Deletes    int        `json:"deletes"`
+	Tables     []string   `json:"tables"`
+	Events     []logEvent `json:"events"`
+}
+
+// GET /api/transactions uses the same filters as /api/logs, but pagination is
+// applied to transactions. Events remain row-level because SQL Server's log
+// records physical row changes, not the original source statement or WHERE.
+func handleTransactions(w http.ResponseWriter, r *http.Request) {
+	appMu.RLock()
+	s := appStore
+	appMu.RUnlock()
+	if s == nil {
+		writeJSON(w, map[string]interface{}{"total": 0, "transactions": []transactionGroup{}})
+		return
+	}
+
+	q := r.URL.Query()
+	limit := queryInt(q.Get("limit"), 20)
+	if limit < 1 {
+		limit = 20
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	page := queryInt(q.Get("page"), 1)
+	if page < 1 {
+		page = 1
+	}
+	off := (page - 1) * limit
+
+	where, args := buildWhere(q.Get("op"), q.Get("db"), q.Get("schema"), q.Get("table"), q.Get("search"), q.Get("since"), q.Get("until"))
+	where = appendWhereCondition(where, "txn_id IS NOT NULL AND txn_id <> ''")
+	conn := s.DB()
+
+	var total int
+	countSQL := "SELECT count(*) FROM (SELECT db_name, txn_id FROM log_events" + where + " GROUP BY db_name, txn_id) txns"
+	if err := conn.QueryRow(countSQL, args...).Scan(&total); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	groupRows, err := conn.Query(`
+		SELECT db_name, txn_id,
+		       CAST(min(event_time) AS VARCHAR),
+		       CAST(max(commit_time) AS VARCHAR),
+		       min(lsn), max(lsn), count(*),
+		       sum(CASE WHEN operation = 'INSERT' THEN 1 ELSE 0 END),
+		       sum(CASE WHEN operation = 'UPDATE' THEN 1 ELSE 0 END),
+		       sum(CASE WHEN operation = 'DELETE' THEN 1 ELSE 0 END)
+		FROM log_events`+where+`
+		GROUP BY db_name, txn_id
+		ORDER BY max(COALESCE(commit_time, event_time)) DESC NULLS LAST, max(lsn) DESC
+		LIMIT `+fmt.Sprint(limit)+` OFFSET `+fmt.Sprint(off), args...)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	groups := make([]transactionGroup, 0, limit)
+	groupIndex := make(map[string]int, limit)
+	var detailConds []string
+	var detailArgs []interface{}
+	for groupRows.Next() {
+		var g transactionGroup
+		var eventTime, commitTime sql.NullString
+		if err := groupRows.Scan(
+			&g.Database, &g.TxnID, &eventTime, &commitTime,
+			&g.FirstLSN, &g.LastLSN, &g.RowCount,
+			&g.Inserts, &g.Updates, &g.Deletes,
+		); err != nil {
+			groupRows.Close()
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		if eventTime.Valid && eventTime.String != "" {
+			g.EventTime = &eventTime.String
+		}
+		if commitTime.Valid && commitTime.String != "" {
+			g.CommitTime = &commitTime.String
+		}
+		g.Tables = []string{}
+		g.Events = []logEvent{}
+		key := transactionKey(g.Database, g.TxnID)
+		groupIndex[key] = len(groups)
+		groups = append(groups, g)
+		detailConds = append(detailConds, "(db_name = ? AND txn_id = ?)")
+		detailArgs = append(detailArgs, g.Database, g.TxnID)
+	}
+	if err := groupRows.Close(); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	if len(groups) > 0 {
+		detailWhere := appendWhereCondition(where, "("+strings.Join(detailConds, " OR ")+")")
+		allArgs := append(append([]interface{}{}, args...), detailArgs...)
+		rows, err := conn.Query(eventSelectColumns+detailWhere+" ORDER BY db_name, txn_id, lsn ASC", allArgs...)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		events := scanEventRows(rows)
+		rows.Close()
+
+		tableSets := make([]map[string]struct{}, len(groups))
+		for i := range tableSets {
+			tableSets[i] = make(map[string]struct{})
+		}
+		for _, event := range events {
+			i, ok := groupIndex[transactionKey(event.Database, event.TxnID)]
+			if !ok {
+				continue
+			}
+			groups[i].Events = append(groups[i].Events, event)
+			table := event.Table
+			if event.SchemaName != "" {
+				table = event.SchemaName + "." + event.Table
+			}
+			if table != "" {
+				tableSets[i][table] = struct{}{}
+			}
+		}
+		for i := range groups {
+			for table := range tableSets[i] {
+				groups[i].Tables = append(groups[i].Tables, table)
+			}
+			sort.Strings(groups[i].Tables)
+		}
+	}
+
+	writeJSON(w, map[string]interface{}{
+		"total": total, "page": page, "limit": limit, "transactions": groups,
+	})
+}
+
+func appendWhereCondition(where, condition string) string {
+	if where == "" {
+		return " WHERE " + condition
+	}
+	return where + " AND " + condition
+}
+
+func transactionKey(database, txnID string) string {
+	return database + "\x00" + txnID
 }
 
 // GET /api/timeline?since=...&until=...&buckets=72&db=&table=&op=&search=

@@ -309,7 +309,16 @@ tailwind.config = {
       <div class="px-5 py-2.5 border-b border-stone-100 flex items-center gap-3 bg-stone-50/60">
         <input type="checkbox" class="rounded border-stone-300 accent-brand-600"
           :checked="allSelected" @change="toggleSelectAll()" :indeterminate.prop="selectedIds.length > 0 && !allSelected">
-        <span class="text-[10px] font-bold uppercase tracking-widest text-stone-400">Event Log</span>
+        <span class="text-[10px] font-bold uppercase tracking-widest text-stone-400"
+              x-text="viewMode === 'transactions' ? 'Transaction Log' : 'Event Log'"></span>
+        <div class="flex rounded-md border border-stone-200 overflow-hidden ml-2">
+          <button @click="setViewMode('transactions')"
+                  :class="viewMode === 'transactions' ? 'bg-stone-800 text-white' : 'bg-white text-stone-400'"
+                  class="px-2.5 py-1 text-[9px] font-bold uppercase tracking-widest transition">Transactions</button>
+          <button @click="setViewMode('rows')"
+                  :class="viewMode === 'rows' ? 'bg-stone-800 text-white' : 'bg-white text-stone-400'"
+                  class="px-2.5 py-1 text-[9px] font-bold uppercase tracking-widest transition">Rows</button>
+        </div>
         <span class="text-[10px] text-stone-300 mono ml-auto" x-text="pageInfo"></span>
       </div>
 
@@ -342,9 +351,60 @@ tailwind.config = {
           <p class="text-stone-400 text-sm">No events found.</p>
         </div>
 
+        <!-- Transaction groups -->
+        <div x-show="viewMode === 'transactions'">
+          <template x-for="group in transactions" :key="group.db_name + group.txn_id">
+            <div class="border-b border-stone-100">
+              <div class="flex items-start gap-4 px-5 py-4 hover:bg-stone-50/70 transition-colors">
+                <input type="checkbox" class="rounded border-stone-300 accent-brand-600 mt-0.5 shrink-0"
+                       :checked="group.events.every(ev => selectedIds.includes(ev.lsn))"
+                       @change="toggleTransaction(group)">
+                <div class="w-2.5 h-2.5 rounded-full mt-2 shrink-0 bg-blue-500"></div>
+                <div class="flex-1 min-w-0">
+                  <div class="flex flex-wrap items-baseline gap-x-2 gap-y-1 mb-1">
+                    <span class="mono text-[11px] text-stone-400 tabular-nums" x-text="formatTime(group.commit_time || group.event_time)"></span>
+                    <span class="text-[11px] font-bold uppercase tracking-widest text-blue-700">Transaction</span>
+                    <span class="mono text-xs font-semibold text-stone-700" x-text="group.txn_id"></span>
+                    <span class="text-xs text-stone-400" x-text="'· ' + group.db_name"></span>
+                    <span class="text-[10px] font-semibold text-stone-500" x-text="group.row_count + ' row changes'"></span>
+                  </div>
+                  <div class="flex flex-wrap gap-2 text-[10px] mono">
+                    <span x-show="group.inserts" class="text-green-700" x-text="group.inserts + ' ins'"></span>
+                    <span x-show="group.updates" class="text-amber-700" x-text="group.updates + ' upd'"></span>
+                    <span x-show="group.deletes" class="text-red-700" x-text="group.deletes + ' del'"></span>
+                    <span class="text-stone-400 truncate" x-text="group.tables.join(', ')"></span>
+                    <span class="text-stone-300" x-text="group.first_lsn + ' → ' + group.last_lsn"></span>
+                  </div>
+                </div>
+                <div class="flex items-center gap-2 shrink-0">
+                  <button @click="toggleTransactionExpanded(group)"
+                    class="text-[10px] font-bold uppercase tracking-widest text-stone-400 hover:text-stone-800 border border-stone-200 px-2.5 py-1 rounded transition whitespace-nowrap"
+                    x-text="expandedTxns[group.db_name + group.txn_id] ? 'Hide rows' : 'Show rows'"></button>
+                  <button @click="showTransactionRollback(group)"
+                    class="text-[10px] font-bold uppercase tracking-widest text-brand-600 hover:text-brand-700 border border-brand-200 px-2.5 py-1 rounded transition whitespace-nowrap">
+                    Rollback →
+                  </button>
+                </div>
+              </div>
+              <div x-show="expandedTxns[group.db_name + group.txn_id]" x-cloak class="bg-stone-50/70 border-t border-stone-100">
+                <template x-for="ev in group.events" :key="ev.lsn">
+                  <div class="flex gap-3 px-12 py-2 border-b border-stone-100 last:border-b-0">
+                    <span class="mono text-[10px] text-stone-300 w-44 shrink-0" x-text="ev.lsn"></span>
+                    <span class="text-[10px] font-bold w-14 shrink-0"
+                          :class="{'text-green-700':ev.operation==='INSERT','text-amber-700':ev.operation==='UPDATE','text-red-700':ev.operation==='DELETE'}"
+                          x-text="ev.operation"></span>
+                    <span class="mono text-[10px] text-stone-500 truncate" x-text="truncSQL(ev.sql_stmt)"></span>
+                  </div>
+                </template>
+              </div>
+            </div>
+          </template>
+        </div>
+
         <!-- Rows -->
-        <template x-for="ev in events" :key="ev.lsn + ev.txn_id">
-          <div class="event-row flex items-start gap-4 px-5 py-3.5 border-b border-stone-100 transition-colors"
+        <div x-show="viewMode === 'rows'">
+          <template x-for="ev in events" :key="ev.lsn + ev.txn_id">
+            <div class="event-row flex items-start gap-4 px-5 py-3.5 border-b border-stone-100 transition-colors"
                :data-lsn="ev.lsn"
                :class="newLsns.includes(ev.lsn) ? 'ev-new ev-selected' : selectedIds.includes(ev.lsn) ? 'bg-brand-50/50 ev-selected' : 'hover:bg-stone-50/70'">
 
@@ -392,14 +452,16 @@ tailwind.config = {
                 Rollback →
               </button>
             </div>
-          </div>
-        </template>
+            </div>
+          </template>
+        </div>
       </div>
 
       <!-- PAGINATION FOOTER -->
       <div class="px-5 py-2.5 border-t border-stone-100 flex flex-wrap items-center gap-3 bg-stone-50/60">
         <div class="flex items-center gap-1.5">
-          <span class="text-[10px] text-stone-400 uppercase tracking-widest font-semibold">Rows</span>
+          <span class="text-[10px] text-stone-400 uppercase tracking-widest font-semibold"
+                x-text="viewMode === 'transactions' ? 'Groups' : 'Rows'"></span>
           <select x-model.number="pageSize" @change="page=1; loadEvents()"
             class="bg-white border border-stone-200 rounded-md px-2 py-1 text-[11px] text-stone-600 focus:outline-none">
             <option value="20">20</option>
@@ -461,7 +523,7 @@ tailwind.config = {
     <div class="flex items-center justify-between px-5 py-3.5 border-b border-stone-100">
       <div class="flex items-center gap-2.5">
         <div class="w-2 h-2 rounded-full bg-brand-500"></div>
-        <h3 class="font-semibold text-sm text-stone-900" x-text="'Bulk Rollback Script (' + selectedIds.length + ' events)'"></h3>
+        <h3 class="font-semibold text-sm text-stone-900" x-text="bulkTitle"></h3>
       </div>
       <button @click="showBulkModal=false" class="text-stone-400 hover:text-stone-700 transition p-1">
         <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
@@ -492,7 +554,10 @@ function dashboard() {
     connecting:   false,
     connectError: '',
 
-    events:     [],
+    events:       [],
+    transactions: [],
+    viewMode:     'transactions',
+    expandedTxns: {},
     stats:      { total:0, inserts:0, updates:0, deletes:0, databases:[], tables:[] },
     totalCount: 0,
 
@@ -515,6 +580,7 @@ function dashboard() {
     newLsns:       [],
     modal:         { show:false, title:'', sql:'', isRollback:false, copied:false },
     bulkScript:    '',
+    bulkTitle:     'Bulk Rollback Script',
     showBulkModal: false,
     bulkCopied:    false,
 
@@ -669,10 +735,14 @@ function dashboard() {
           since:  this.filters.from ? new Date(this.filters.from).toISOString() : '',
           until:  this.filters.to   ? new Date(this.filters.to).toISOString()   : '',
         });
-        const r = await fetch(`${this.agentUrl}/api/logs?${p}`);
+        const endpoint = this.viewMode === 'transactions' ? 'transactions' : 'logs';
+        const r = await fetch(`${this.agentUrl}/api/${endpoint}?${p}`);
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        const d     = await r.json();
-        this.events     = d.events || [];
+        const d = await r.json();
+        this.transactions = d.transactions || [];
+        this.events = this.viewMode === 'transactions'
+          ? this.transactions.flatMap(group => group.events || [])
+          : (d.events || []);
         this.totalCount = d.total  || 0;
       } catch (e) {
         console.error('loadEvents:', e);
@@ -713,7 +783,7 @@ function dashboard() {
 
     startPolling() {
       this.polling   = true;
-      this.lastTotal = this.totalCount;
+      this.lastTotal = this.stats.total || 0;
       this.pollingTimer = setInterval(async () => {
         this.pulling = true;
         try {
@@ -731,7 +801,7 @@ function dashboard() {
                 setTimeout(() => { this.newLsns = []; }, 3000);
               }
             } else {
-              this.totalCount = newTotal;
+              await this.loadEvents();
             }
           }
         } finally {
@@ -744,6 +814,15 @@ function dashboard() {
       if (this.sortCol === col) this.sortDir = this.sortDir === 'desc' ? 'asc' : 'desc';
       else { this.sortCol = col; this.sortDir = 'desc'; }
       this.page = 1;
+      this.loadEvents();
+    },
+
+    setViewMode(mode) {
+      if (this.viewMode === mode) return;
+      this.viewMode = mode;
+      this.page = 1;
+      this.selectedIds = [];
+      this.selectedEvs = {};
       this.loadEvents();
     },
 
@@ -787,6 +866,25 @@ function dashboard() {
           }
         });
       }
+    },
+
+    toggleTransaction(group) {
+      const selected = group.events.every(ev => this.selectedIds.includes(ev.lsn));
+      group.events.forEach(ev => {
+        const idx = this.selectedIds.indexOf(ev.lsn);
+        if (selected && idx >= 0) {
+          this.selectedIds.splice(idx, 1);
+          delete this.selectedEvs[ev.lsn];
+        } else if (!selected && idx < 0) {
+          this.selectedIds.push(ev.lsn);
+          this.selectedEvs[ev.lsn] = ev;
+        }
+      });
+    },
+
+    toggleTransactionExpanded(group) {
+      const key = group.db_name + group.txn_id;
+      this.expandedTxns[key] = !this.expandedTxns[key];
     },
 
     showSQL(ev) {
@@ -841,8 +939,36 @@ function dashboard() {
       lines.push('-- ROLLBACK TRANSACTION; ← Or rollback if unsure');
 
       this.bulkScript    = lines.join('\n');
+      this.bulkTitle     = `Bulk Rollback Script (${evs.length} events)`;
       this.showBulkModal = true;
       this.bulkCopied    = false;
+    },
+
+    showTransactionRollback(group) {
+      const evs = (group.events || [])
+        .filter(ev => ev.rollback_sql && !ev.rollback_sql.startsWith('--'))
+        .sort((a, b) => b.lsn.localeCompare(a.lsn));
+      const lines = [
+        '-- ============================================================',
+        '-- Transaction Rollback Script · rollback4sqlserver by dbaops',
+        `-- Database: ${group.db_name}`,
+        `-- Transaction: ${group.txn_id}`,
+        `-- Source LSN range: ${group.first_lsn} → ${group.last_lsn}`,
+        `-- Row changes: ${group.row_count}; executable rollback rows: ${evs.length}`,
+        '-- Applied in reverse LSN order.',
+        '-- ============================================================',
+        '', 'BEGIN TRANSACTION;', '',
+      ];
+      evs.forEach((ev, i) => {
+        lines.push(`-- [${i+1}] LSN: ${ev.lsn}  OP: ${ev.operation}  TABLE: ${ev.schema_name||''}.${ev.table_name}`);
+        lines.push(ev.rollback_sql.trim(), '');
+      });
+      lines.push('-- COMMIT TRANSACTION;  ← Uncomment after review');
+      lines.push('-- ROLLBACK TRANSACTION; ← Or rollback if unsure');
+      this.bulkScript = lines.join('\n');
+      this.bulkTitle = `Transaction Rollback (${group.row_count} row changes)`;
+      this.showBulkModal = true;
+      this.bulkCopied = false;
     },
 
     copyBulk() {

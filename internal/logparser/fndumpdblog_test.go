@@ -36,3 +36,23 @@ func TestTRNReader_URLFilesAreSequentialBackupSets(t *testing.T) {
 		t.Fatalf("device=%s", got)
 	}
 }
+
+func TestBuildDumpChunkQueryUsesLSNCursorAndLimit(t *testing.T) {
+	query := buildDumpChunkQuery(
+		"000000CE:00000418:0010",
+		"",
+		[]string{`C:\backups\log.trn`},
+		[]string{OpBeginXact, OpCommitXact},
+		5000,
+	)
+	for _, want := range []string{
+		"SELECT TOP (5000)",
+		"fn_dump_dblog(N'000000CE:00000418:0010',NULL",
+		"[Current LSN]>N'000000CE:00000418:0010'",
+		"ORDER BY [Current LSN]",
+	} {
+		if !strings.Contains(query, want) {
+			t.Fatalf("query missing %q: %s", want, query)
+		}
+	}
+}
