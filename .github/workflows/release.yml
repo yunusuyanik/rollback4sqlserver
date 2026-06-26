@@ -9,8 +9,8 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build release binaries
+  linux:
+    name: Build Linux amd64
     runs-on: ubuntu-latest
 
     steps:
@@ -23,39 +23,73 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Install Windows cross compiler
-        run: sudo apt-get update && sudo apt-get install -y mingw-w64
-
       - name: Test
         run: go test ./...
 
-      - name: Build Linux amd64
+      - name: Build
         env:
           CGO_ENABLED: "1"
           GOOS: linux
           GOARCH: amd64
         run: |
-          mkdir -p dist
           mkdir -p dist/linux-amd64
           go build -ldflags="-s -w" -o dist/linux-amd64/rollback4sqlserver ./cmd/logrecovery
+          tar -czf dist/rollback4sqlserver-linux-amd64.tar.gz -C dist/linux-amd64 rollback4sqlserver
 
-      - name: Build Windows amd64
+      - name: Upload Linux package
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollback4sqlserver-linux-amd64
+          path: dist/rollback4sqlserver-linux-amd64.tar.gz
+
+  windows:
+    name: Build Windows amd64
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install Windows cross compiler
+        run: brew install mingw-w64
+
+      - name: Build
         env:
           CGO_ENABLED: "1"
           GOOS: windows
           GOARCH: amd64
           CC: x86_64-w64-mingw32-gcc
           CXX: x86_64-w64-mingw32-g++
-          CGO_LDFLAGS: -lwinpthread
         run: |
           mkdir -p dist/windows-amd64
-          go build -ldflags="-s -w -extld=x86_64-w64-mingw32-g++" -o dist/windows-amd64/rollback4sqlserver.exe ./cmd/logrecovery
+          go build -ldflags="-s -w" -o dist/windows-amd64/rollback4sqlserver.exe ./cmd/logrecovery
+          zip -j dist/rollback4sqlserver-windows-amd64.zip dist/windows-amd64/rollback4sqlserver.exe
 
-      - name: Package
-        run: |
-          cd dist
-          tar -czf rollback4sqlserver-linux-amd64.tar.gz -C linux-amd64 rollback4sqlserver
-          zip -j rollback4sqlserver-windows-amd64.zip windows-amd64/rollback4sqlserver.exe
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollback4sqlserver-windows-amd64
+          path: dist/rollback4sqlserver-windows-amd64.zip
+
+  publish:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - linux
+      - windows
+
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
 
       - name: Publish GitHub Release
         env:
