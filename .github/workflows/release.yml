@@ -44,7 +44,7 @@ jobs:
           CGO_ENABLED: "1"
           GOOS: windows
           GOARCH: amd64
-          CC: x86_64-w64-mingw32-gcc
+          CC: x86_64-w64-mingw32-g++
           CXX: x86_64-w64-mingw32-g++
           CGO_LDFLAGS: -lwinpthread
         run: |
