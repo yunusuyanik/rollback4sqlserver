@@ -95,9 +95,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          cat > dist/release-notes.md <<'EOF'
+          Local SQL Server transaction log recovery tool.
+
+          Downloads:
+
+          - Windows: `rollback4sqlserver-windows-amd64.zip` contains `rollback4sqlserver.exe`
+          - Linux: `rollback4sqlserver-linux-amd64.tar.gz` contains `rollback4sqlserver`
+
+          License:
+
+          - Noncommercial use only under the PolyForm Noncommercial License 1.0.0
+          - Commercial use requires a separate license from dbaops
+          EOF
           gh release create "${GITHUB_REF_NAME}" \
             dist/rollback4sqlserver-linux-amd64.tar.gz \
             dist/rollback4sqlserver-windows-amd64.zip \
             --repo "${GITHUB_REPOSITORY}" \
             --title "rollback4sqlserver ${GITHUB_REF_NAME}" \
-            --notes "rollback4sqlserver is a local SQL Server transaction log recovery tool. Download the Windows package for rollback4sqlserver.exe or the Linux package for the rollback4sqlserver binary. Licensed for noncommercial use only under the PolyForm Noncommercial License 1.0.0; commercial use requires a separate license from dbaops."
+            --notes-file dist/release-notes.md
