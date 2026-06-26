@@ -64,4 +64,6 @@ go build -ldflags="-s -w" -o rollback4sqlserver ./cmd/logrecovery
 
 ## License
 
-MIT License.
+PolyForm Noncommercial License 1.0.0.
+
+Personal, educational, research, government, charity, public health, public safety, and other noncommercial use is permitted. Commercial use is not permitted without a separate commercial license from dbaops.

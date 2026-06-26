@@ -100,4 +100,4 @@ jobs:
             dist/rollback4sqlserver-windows-amd64.zip \
             --repo "${GITHUB_REPOSITORY}" \
             --title "rollback4sqlserver ${GITHUB_REF_NAME}" \
-            --notes "Windows package contains rollback4sqlserver.exe. Linux package contains rollback4sqlserver."
+            --notes "rollback4sqlserver is a local SQL Server transaction log recovery tool. Download the Windows package for rollback4sqlserver.exe or the Linux package for the rollback4sqlserver binary. Licensed for noncommercial use only under the PolyForm Noncommercial License 1.0.0; commercial use requires a separate license from dbaops."
