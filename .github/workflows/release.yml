@@ -44,12 +44,12 @@ jobs:
           CGO_ENABLED: "1"
           GOOS: windows
           GOARCH: amd64
-          CC: x86_64-w64-mingw32-g++
+          CC: x86_64-w64-mingw32-gcc
           CXX: x86_64-w64-mingw32-g++
           CGO_LDFLAGS: -lwinpthread
         run: |
           mkdir -p dist/windows-amd64
-          go build -ldflags="-s -w" -o dist/windows-amd64/rollback4sqlserver.exe ./cmd/logrecovery
+          go build -ldflags="-s -w -extld=x86_64-w64-mingw32-g++" -o dist/windows-amd64/rollback4sqlserver.exe ./cmd/logrecovery
 
       - name: Package
         run: |
