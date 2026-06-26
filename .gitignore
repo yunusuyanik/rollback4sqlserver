@@ -1,4 +1,6 @@
 dist/
+.gocache/
+.gomodcache/
 *.exe
 *.db
 *.db-shm
