@@ -36,7 +36,8 @@ jobs:
           GOARCH: amd64
         run: |
           mkdir -p dist
-          go build -ldflags="-s -w" -o dist/rollback4sqlserver-linux-amd64 ./cmd/logrecovery
+          mkdir -p dist/linux-amd64
+          go build -ldflags="-s -w" -o dist/linux-amd64/rollback4sqlserver ./cmd/logrecovery
 
       - name: Build Windows amd64
         env:
@@ -45,14 +46,16 @@ jobs:
           GOARCH: amd64
           CC: x86_64-w64-mingw32-gcc
           CXX: x86_64-w64-mingw32-g++
+          CGO_LDFLAGS: -lwinpthread
         run: |
-          go build -ldflags="-s -w" -o dist/rollback4sqlserver-windows-amd64.exe ./cmd/logrecovery
+          mkdir -p dist/windows-amd64
+          go build -ldflags="-s -w" -o dist/windows-amd64/rollback4sqlserver.exe ./cmd/logrecovery
 
       - name: Package
         run: |
           cd dist
-          tar -czf rollback4sqlserver-linux-amd64.tar.gz rollback4sqlserver-linux-amd64
-          zip rollback4sqlserver-windows-amd64.zip rollback4sqlserver-windows-amd64.exe
+          tar -czf rollback4sqlserver-linux-amd64.tar.gz -C linux-amd64 rollback4sqlserver
+          zip -j rollback4sqlserver-windows-amd64.zip windows-amd64/rollback4sqlserver.exe
 
       - name: Publish GitHub Release
         env:
@@ -63,4 +66,4 @@ jobs:
             dist/rollback4sqlserver-windows-amd64.zip \
             --repo "${GITHUB_REPOSITORY}" \
             --title "rollback4sqlserver ${GITHUB_REF_NAME}" \
-            --notes "Download the Windows exe or Linux amd64 binary below."
+            --notes "Windows package contains rollback4sqlserver.exe. Linux package contains rollback4sqlserver."
